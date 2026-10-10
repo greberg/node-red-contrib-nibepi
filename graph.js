@@ -99,21 +99,21 @@ module.exports = function(RED) {
                 }
                 node.send({graph:"datagraph",payload:buildGraph(arr)});
             } else if(config.select=="start_1") {
-                let arr = buildGraph(
-                    [
-                        {name:"Utomhustemperatur",register:server.hP()['outside']},
-                        {name:"Inomhustemperatur",register:server.hP()['inside']},
-                        {name:"Kurvjustering S1",register:server.hP()['curveadjust_s1']},
-                        {name:"Börvärde S1",register:server.hP()['setpoint_s1']},
-                        {name:"Framledning S1",register:server.hP()['supply_s1']}
-                    ]
-                );
+                let arr = [
+                    {name:"Utomhustemperatur",register:server.hP()['outside']},
+                    {name:"Inomhustemperatur",register:server.hP()['inside']},
+                    {name:"Kurvjustering S1",register:server.hP()['curveadjust_s1']},
+                    {name:"Börvärde S1",register:server.hP()['setpoint_s1']},
+                    {name:"Framledning S1",register:server.hP()['supply_s1']}
+                ];
+                // The S2 series go into buildGraph's input; they used to be
+                // pushed onto its output, so S2 was never graphed.
                 if(systems!==undefined && systems.s2===true) {
                     arr.push({name:"Kurvjustering S2",register:server.hP()['curveadjust_s2']});
                     arr.push({name:"Börvärde S2",register:server.hP()['setpoint_s2']});
                     arr.push({name:"Framledning S2",register:server.hP()['supply_s2']});
                 }
-                node.send({graph:"start_1",payload:arr});
+                node.send({graph:"start_1",payload:buildGraph(arr)});
             } else if(config.select=="forecast_1") {
                 let arr = [
                     {name:"Utomhustemperatur",register:server.hP()['outside']},
