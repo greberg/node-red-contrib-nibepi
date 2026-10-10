@@ -4650,15 +4650,22 @@ if (!level || (typeof level === 'string' && !['VERY_CHEAP','CHEAP','NORMAL','EXP
 }
 
                         if(config.price[`${level}_POOL_HEAT`]!==undefined) {
-                            if(level=="NORMAL") {
-                                nibe.setData(hP['pool_start_temp_'+system],config.price.NORMAL_START_POOL_HEAT)
-                                nibe.setData(hP['pool_stop_temp_'+system],config.price.NORMAL_STOP_POOL_HEAT)
+                            // Config values may be strings ("28" + 2 = "282");
+                            // coerce, keep within the register range 5..80 °C and
+                            // pool_max_temp, and only write a changed value.
+                            let maxTemp = Number(config.price.pool_max_temp);
+                            if(!Number.isFinite(maxTemp) || maxTemp>80) maxTemp = 80;
+                            const clampPool = (v) => Math.max(5,Math.min(v,maxTemp));
+                            const adjust = (level=="NORMAL") ? 0 : Number(config.price[`${level}_POOL_HEAT`]);
+                            const start = Number(config.price.NORMAL_START_POOL_HEAT);
+                            const stop = Number(config.price.NORMAL_STOP_POOL_HEAT);
+                            if(Number.isFinite(adjust) && Number.isFinite(start) && Number.isFinite(stop)) {
+                                const newStart = clampPool(start+adjust);
+                                const newStop = clampPool(stop+adjust);
+                                if(Number(val(poolStart))!==newStart) nibe.setData(hP['pool_start_temp_'+system],newStart)
+                                if(Number(val(poolStop))!==newStop) nibe.setData(hP['pool_stop_temp_'+system],newStop)
                             } else {
-                                var adjust = config.price[`${level}_POOL_HEAT`]
-                                var start = config.price.NORMAL_START_POOL_HEAT
-                                var stop = config.price.NORMAL_STOP_POOL_HEAT
-                                nibe.setData(hP['pool_start_temp_'+system],Math.min(start+adjust,config.price.pool_max_temp))
-                                nibe.setData(hP['pool_stop_temp_'+system],Math.min(stop+adjust,config.price.pool_max_temp))
+                                nibe.log(`Ogiltiga poolinställningar, skriver inte`,'price','error');
                             }
 
                             resolve(values)
@@ -4668,7 +4675,10 @@ if (!level || (typeof level === 'string' && !['VERY_CHEAP','CHEAP','NORMAL','EXP
 
                     }).catch((err) => {
                         sendError('Elprisreglering Poolstyrning',`Kunde inte hämta data, har värmepumpen stöd för pool?`);
+                        resolve();
                     });
+                } else {
+                    resolve();
                 }
             } catch(err) {
                 reject(err)
@@ -5648,12 +5658,21 @@ async function runRMU(result,array) {
         let register = nibe.getRegister();
         let sensor = register.find(index => index.register == hP['rmu_sensor_s'+i]);
         if(sensor!==undefined && sensor.mode=="R/W") {
-            if(inside!==undefined) {
-                nibe.setData(hP['rmu_sensor_s'+i],inside.data);
-            } else {
+            // Only plausible, fresh values reach the pump's room sensor input,
+            // and one system without a value must not stop the others.
+            const configured = (config.rmu['sensor_s'+i]!==undefined && config.rmu['sensor_s'+i]!=="");
+            // Systems 2-4 were never reached before; stay quiet where no sensor is set.
+            if(i>1 && !configured) continue;
+            const value = (inside!==undefined && inside!==null) ? Number(inside.data) : NaN;
+            if(inside===undefined || !Number.isFinite(value) || value<-30 || value>50) {
                 sendError(`RMU40 System ${i}`,`Givare har inga värden, avbryter...`);
-                return;
+                continue;
             }
+            if(inside.timestamp!==undefined && sensorIsStale(inside.timestamp,Date.now())) {
+                sendError(`RMU40 System ${i}`,`Givaren har inte uppdaterats, avbryter...`);
+                continue;
+            }
+            nibe.setData(hP['rmu_sensor_s'+i],value);
             data.rmuSensor = inside;
             nibeData.emit('pluginRMU',data);
         } else {
@@ -5671,7 +5690,9 @@ async function getNibeData(register) {
             reject(err);
         });
     } else {
-        resolve(savedData[register]);
+        // A copy: callers adjust the value they get (hwStopTemp.data -= 1),
+        // which used to change the shared cache for everyone else.
+        resolve(Object.assign({}, savedData[register]));
     }
 });
 return promise;
