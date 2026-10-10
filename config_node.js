@@ -2712,7 +2712,7 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                 let factor = 1;
                 if(((1 <= dir) && (dir <= 45)) || ((315 <= dir) && (dir <= 360))) {
                     direction = -1;
-                    if(config.weather.wind_factor_n===undefined) config.weather.wind_factor_n = 0; nibe.setConfig(config);
+                    if(config.weather.wind_factor_n===undefined) {config.weather.wind_factor_n = 0; nibe.setConfig(config);}
                     factor = config.weather.wind_factor_n;
                 } else if(136 <= dir && dir <= 225) {
                     direction = -2;
@@ -2767,6 +2767,26 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
           }
             return output;
         }
+    // The forecast offset is computed once an hour. When the forecast cannot
+    // be fetched it used to stay on the curve indefinitely; after 3 hours
+    // without a fresh forecast it goes back to 0.
+    const WEATHER_STALE_MS = 3 * 3600000;
+    const weatherLastOk = {};
+    const weatherReset = (system,timeNow) => {
+        if(weatherOffset[system]!==0) {
+            nibe.log(`Sätter kurvjustering till 0`,'weather','debug');
+            curveAdjust('weather',system,0);
+            weatherOffset[system] = 0;
+        }
+        saveDataGraph('weather_offset_'+system,timeNow,0,true);
+    }
+    const weatherFail = (system,timeNow,message) => {
+        nibe.log(message,'weather','error');
+        const last = weatherLastOk[system];
+        if(last===undefined || timeNow-last>=WEATHER_STALE_MS) {
+            weatherReset(system,timeNow);
+        }
+    }
     const runWeather = async (val) => {
         nibe.log(`Startar Prognosreglering`,'weather','debug');
         let timeNow = Date.now();
@@ -2785,14 +2805,14 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                 config.weather.enable_down = true
                 nibe.setConfig(config);
             }
-            let outside = val.outside.data;
+            let outside = (val.outside!==undefined && val.outside!==null) ? val.outside.data : undefined;
             nibe.log(`Aktuell utomhustemperatur: ${outside}`,'weather','debug');
             if(val['heatcurve_'+val.system]===undefined) {
                 console.log('Hämtar värmekurva manuellt.')
                 val['heatcurve_'+val.system] = await getNibeData(hP['heatcurve_'+val.system]).catch(logCatch)
             }
             if(val['heatcurve_'+val.system]===undefined) {
-                nibe.log(`Kunde inte läsa värmekurvan, hoppar över prognosreglering.`,'weather','error');
+                weatherFail(val.system,timeNow,`Kunde inte läsa värmekurvan, hoppar över prognosreglering.`);
                 return;
             }
             let heatcurve = val['heatcurve_'+val.system].data;
@@ -2806,12 +2826,14 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                 if(!Number.isFinite(hours) || hours < 0) hours = 0;
                 const tsCount = Math.max(49, hours + 1);
                 const weatherUrl = `https://opendata-download-metfcst.smhi.se/api/category/snow1g/version/1/geotype/point/lon/${lon}/lat/${lat}/data.json?timeseries=${tsCount}&parameters=air_temperature,wind_speed,wind_from_direction,wind_speed_of_gust,symbol_code`;
-                https.get(weatherUrl, (resp) => {
+                const weatherReq = https.get(weatherUrl, (resp) => {
                     let data = '';
                     resp.on('data', (chunk) => {
                     data += chunk;
                     });
                     resp.on('end', () => {
+                        // Runs in a socket callback: a throw here would not reach safeRun.
+                        try {
                         if(resp.statusCode===200) {
                             let time = Number((Date.now()).toFixed())+(hours*3600000);
                             const astro = suncalc({lat:lat,lon:lon,timestamp:time})
@@ -2884,13 +2906,16 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                                 }
                                 nibe.log(`Aktuell solfaktor är: ${sunFactor}`,'weather','debug');
                             }
-                                    if(outside===undefined || heatcurve===undefined) {
-                                        if(outside===undefined) nibe.log(`Saknar värde från utomhusgivare`,'weather','error');
+                                    // Invalid inputs: the offset would be meaningless, so 0.
+                                    if(outside===undefined || heatcurve===undefined || !Number.isFinite(Number(outside))) {
+                                        if(outside===undefined || !Number.isFinite(Number(outside))) nibe.log(`Saknar värde från utomhusgivare`,'weather','error');
                                         if(heatcurve===undefined) nibe.log(`Saknar värde från värmekurva`,'weather','error');
+                                        weatherReset(val.system,timeNow);
                                         return;
                                     }
                                     if(heatcurve===0) {
                                         nibe.log(`Prognosreglering fungerar inte med egen värmekurva.`,'weather','error');
+                                        weatherReset(val.system,timeNow);
                                         return;
                                     }
                                     if(config.weather.forecast_adjust===undefined) {
@@ -2963,6 +2988,7 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                                     }
                                     nibe.log(`Utför kurvjustering, värde: ${setOffset}`,'weather','debug');
                                     curveAdjust('weather',val.system,setOffset);
+                                    weatherLastOk[val.system] = timeNow;
                                     val.windGraph = wind.graph;
                                     val.weatherOffset = setOffset;
                                     weatherOffset[val.system] = setOffset;
@@ -3000,10 +3026,17 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                             }
                             saveDataGraph('weather_offset_'+val.system,timeNow,0,true);
                         }
+                        } catch(err) {
+                            weatherFail(val.system,timeNow,`Fel i prognosregleringen: ${err && err.message ? err.message : err}`);
+                        }
                     });
 
-                }).on("error", (err) => {
-                    nibe.log(err.message,'weather','error');
+                });
+                weatherReq.setTimeout(15000, () => {
+                    weatherReq.destroy(new Error('Timeout efter 15 s mot SMHI'));
+                });
+                weatherReq.on("error", (err) => {
+                    weatherFail(val.system,timeNow,err.message);
                 });
             } else {
                 nibe.log(`Inga koordinater inlagda.`,'weather','error');
