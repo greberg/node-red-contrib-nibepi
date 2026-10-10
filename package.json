@@ -1,6 +1,6 @@
 {
   "dependencies": {
-    "nibepi": "github:fnordpojk/nibepi-backend#master",
+    "nibepi": "github:greberg/nibepi-backend#improvements",
     "node-cron": "^4.6.0",
     "node-red-dashboard": "~3.6.6",
     "node-red-node-ui-list": "~0.3.6",
