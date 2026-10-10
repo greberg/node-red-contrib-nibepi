@@ -1,20 +1,38 @@
 module.exports = function(RED) {
     function nibeRequest(config) {
         RED.nodes.createNode(this,config);
-        var timer;
         var reqOn = false;
         var absentReported = false;
+        // Every pending timer, so close() can stop them from sending on a
+        // closed node.
+        const timers = new Set();
+        const later = (fn, ms) => {
+            const t = setTimeout(() => { timers.delete(t); fn(); }, ms);
+            timers.add(t);
+            return t;
+        };
+        const cancel = (t) => { clearTimeout(t); timers.delete(t); };
+        let closed = false;
+        this.on('close', function() {
+            closed = true;
+            reqOn = false;
+            for (const t of timers) clearTimeout(t);
+            timers.clear();
+        });
         this.server = RED.nodes.getNode(config.server);
+        if (!this.server) {
+            this.status({ fill: 'red', shape: 'dot', text: `No configuration node configured` });
+            return;
+        }
         let nibe = this.server.nibe;
         const suncalc = this.server.suncalc;
-        if (this.server) {
             this.on('input', function(msg) {
                 let register = config.name;
                 if(this.server.hP()[config.name]!==undefined) {
                     register = this.server.hP()[config.name]
                 }
                 if(register.toLowerCase()=="astro") {
-                    timer = setTimeout(() => {
+                    later(() => {
                         this.status({ fill: 'yellow', shape: 'dot', text: `` });
                     }, 5000);
                     this.status({ fill: 'green', shape: 'dot', text: `Requesting astro data` });
@@ -53,18 +71,29 @@ module.exports = function(RED) {
                     }
                     if(reqOn===false) {
                         reqOn = true;
+                        // Exactly one of result, error or timeout answers this
+                        // request; a late reply after the timeout is dropped
+                        // instead of sending the message a second time.
+                        let settled = false;
+                        const settle = () => {
+                            if(settled || closed) return false;
+                            settled = true;
+                            cancel(timer);
+                            reqOn = false;
+                            return true;
+                        };
                         this.status({ fill: 'yellow', shape: 'dot', text: `Requesting data` });
                         nibe.reqData(register).then(result => {
+                            if(!settle()) return;
                             this.status({ fill: 'green', shape: 'dot', text: `Value: ${result.data}${result.unit}` });
-                            clearTimeout(timer);
                             msg[config.name+"_raw"] = result;
                             msg[config.name] = result.data;
                             this.send([msg,{topic:config.name,payload:result.data}])
-                            reqOn = false;
-                            setTimeout(() => {
+                            later(() => {
                                 this.status({ fill: 'yellow', shape: 'dot', text: `` });
                             }, 10000);
                         }).catch((err) => {
+                            if(!settle()) return;
                             const message = (err!==undefined && err!==null && err.message!==undefined) ? err.message : String(err);
                             // These nodes cover several pump models, so the ones for
                             // other models permanently miss on this one. Say that once
@@ -79,20 +108,22 @@ module.exports = function(RED) {
                                 console.log(message)
                                 this.status({ fill: 'red', shape: 'dot', text: `Could not get data.` });
                             }
+                            // Pass the message on now, as the timeout below used
+                            // to do 30 s later, with the reason attached.
+                            msg.error = message;
+                            this.send(msg);
                         })
-                        timer = setTimeout(() => {
-                            reqOn = false;
+                        const timer = later(() => {
+                            if(!settle()) return;
+                            msg.error = 'Timeout requesting data';
                             this.send(msg);
                             this.status({ fill: 'red', shape: 'dot', text: `Timeout requesting data` });
-                        }, 30000,msg);
+                        }, 30000);
                         
                     }
                     
                 }
             });
-        } else {
-            // No config node configured
-        }
     }
     RED.nodes.registerType("nibe-request",nibeRequest);
 }
