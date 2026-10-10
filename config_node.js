@@ -60,7 +60,7 @@ module.exports = function(RED) {
     };
     const nibeData = new EventEmitter()
     const nibe = require('nibepi')
-    // Replacement for .catch(logCatch) on pump requests. Resolves to
+    // Replacement for .catch(console.log) on pump requests. Resolves to
     // undefined like before, but: stays quiet while the pump has not announced
     // its model yet (every request fails then and startup reruns on the next
     // 'ready'), logs one line instead of a stack trace, and repeats the same
