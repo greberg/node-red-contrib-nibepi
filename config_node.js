@@ -2911,6 +2911,12 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
 
     }
     const indoorArray = [];
+    const indoorReset = (system) => {
+        if(indoorOffset[system]!==0) {
+            indoorOffset[system] = 0;
+            curveAdjust('indoor',system,0);
+        }
+    }
     const runIndoor = (data,array) => {
         var timeNow = Date.now();
         //let data = Object.assign({}, result);
@@ -2931,8 +2937,12 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
             }
             }
         if(inside===undefined) inside = data['inside_'+data.system];
-        if(inside===undefined || inside.data===undefined || inside.data<4) {
+        // Without a valid sensor or setpoint the indoor part goes back to 0;
+        // returning early used to leave the last offset (up to ±10) in place.
+        if(inside===undefined || inside.data===undefined || !Number.isFinite(Number(inside.data)) || inside.data<4) {
             sendError('Inomhusreglering',`Inomhusgivare saknas (${data.system}), avbryter...`);
+            indoorReset(data.system);
+            data.indoorOffset = 0;
             return;
         }
         data.indoorSensor = inside;
@@ -2941,6 +2951,12 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
         let factor = data['inside_factor_'+data.system];
         let dM = data.dM;
         let dMstart = data.dMstart;
+        if(inside_set===undefined || inside_set===null || !Number.isFinite(Number(inside_set.data))) {
+            sendError('Inomhusreglering',`Börvärde för inomhustemperatur saknas (${data.system}), avbryter...`);
+            indoorReset(data.system);
+            data.indoorOffset = 0;
+            return;
+        }
         // Calculate setpoint accuracy
         if(inside!==undefined) {
             indoorArray.unshift({set:inside_set.data,act:inside.data});
@@ -2954,7 +2970,7 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
         }
         // Restore degree minutes if the inside conditions are good.
         if(conf.system.pump!=="F370" && conf.system.pump!=="F470") {
-            if(conf.indoor.dm_reset_enable===true) {
+            if(conf.indoor.dm_reset_enable===true && dM!==undefined && dM!==null && dMstart!==undefined && dMstart!==null) {
                 if(conf.indoor.dm_reset_value===undefined) {
                     conf.indoor.dm_reset_value = -200;
                     nibe.setConfig(conf);
@@ -2981,6 +2997,12 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
             }
         }
             if(conf.indoor['enable_'+data.system]!==undefined && conf.indoor['enable_'+data.system]===true) {
+                if(factor===undefined || factor===null || !Number.isFinite(Number(factor.data))) {
+                    sendError('Inomhusreglering',`Faktor för inomhusreglering saknas (${data.system}), avbryter...`);
+                    indoorReset(data.system);
+                    data.indoorOffset = 0;
+                    return;
+                }
                 var setOffset = Number((((inside_set.data)-inside.data)*factor.data).toFixed(2));
                 data.indoorOffset = setOffset;
                 indoorOffset[data.system] = setOffset;
