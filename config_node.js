@@ -5664,6 +5664,11 @@ const checkTranslation = (node) => {
         return rmu_ready;
     }
     nibe.data.on('updateSensor',data => {
+        // Restart plugins so they pick up the changed sensor list - but only
+        // once the pump is connected. nibe.core is set when the pump has
+        // announced its model; MQTT usually connects before that, and the real
+        // 'ready' follows from initiateCore anyway.
+        if(nibe.core===undefined || nibe.core.connected!==true) return;
         nibeData.emit('ready',true);
     })
         nibe.data.on('fault',data => {
