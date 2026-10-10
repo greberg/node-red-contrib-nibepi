@@ -1,5 +1,5 @@
 
-const { subscriber, serialized, coreConnected } = require('./node_util');
+const { subscriber, serialized, coreConnected, applyConfigTopic } = require('./node_util');
 module.exports = function(RED) {
      function nibeWeather(config) {
         RED.nodes.createNode(this,config);
@@ -61,9 +61,13 @@ module.exports = function(RED) {
                 return;
             }
             if(msg.payload!==undefined && msg.topic!==undefined && msg.topic!=="") {
-                let req = msg.topic.split('/');
-                if(conf[req[0]][req[1]+'_'+config.system]!==msg.payload) {
-                    conf[req[0]][req[1]+'_'+config.system] = msg.payload;
+                // Only this node's own config categories are writable (see applyConfigTopic).
+                const res = applyConfigTopic(conf, msg.topic, msg.payload, ['weather','home'], '_'+config.system);
+                if(res.error!==undefined) {
+                    this.error(res.error, msg);
+                    return;
+                }
+                if(res.changed) {
                     server.nibe.setConfig(conf);
                     start();
                 }

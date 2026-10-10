@@ -1,5 +1,5 @@
 
-const { subscriber, serialized, coreConnected } = require('./node_util');
+const { subscriber, serialized, coreConnected, applyConfigTopic } = require('./node_util');
 module.exports = function(RED) {
     function nibeFan(config) {
         RED.nodes.createNode(this,config);
@@ -55,12 +55,13 @@ module.exports = function(RED) {
                 return;
             }
             if(msg.payload!==undefined && msg.topic!==undefined && msg.topic!=="") {
-                let req = msg.topic.split('/');
-                if(conf[req[0]]===undefined) conf[req[0]] = {};
-                if(conf[req[0]][req[1]]!==msg.payload) {
-                    conf[req[0]][req[1]] = msg.payload;
-                    server.nibe.setConfig(conf);
+                // Only this node's own config categories are writable (see applyConfigTopic).
+                const res = applyConfigTopic(conf, msg.topic, msg.payload, ['fan'], '');
+                if(res.error!==undefined) {
+                    this.error(res.error, msg);
+                    return;
                 }
+                if(res.changed) server.nibe.setConfig(conf);
                 start();
             }
             
