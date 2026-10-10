@@ -2052,6 +2052,24 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
             }
         }
     }
+    // One NaN component (missing sensor, bad config value) used to make the
+    // whole sum NaN, and the curve then stayed at its last value for good.
+    // A non-finite part counts as 0 (logged at most once an hour), and each
+    // part is clamped to ±10 like the total.
+    const curveWarnSeen = {};
+    const curveComponent = (system,item) => {
+        const value = Number(item.data);
+        if(!Number.isFinite(value)) {
+            const key = system+'_'+item.name;
+            const now = Date.now();
+            if(curveWarnSeen[key]===undefined || now-curveWarnSeen[key]>3600000) {
+                curveWarnSeen[key] = now;
+                nibe.log(`Ogiltig kurvjustering från ${item.name} (${system}): ${item.data}, räknas som 0`,'system','error');
+            }
+            return 0;
+        }
+        return Math.max(-10,Math.min(10,value));
+    }
     const curveAdjust = (type,system,data) => {
         let curveadjust;
         if(hP!==undefined) {
@@ -2085,7 +2103,7 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                     if(run===true) {
                         timer[system] = setTimeout((i) => {
                             for( var o = 0; o < adjust[i].data.length; o++){
-                                out = out+adjust[i].data[o].data;
+                                out = out+curveComponent(system,adjust[i].data[o]);
                             }
                             out = out;
                             nibe.reqData(curveadjust).then(result => {
@@ -2095,7 +2113,7 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                                     nibe.setConfig(config);
                                 }
                                 if(config.home['adjust_'+system]!==undefined) {
-                                    out = out+Number(config.home['adjust_'+system]);
+                                    out = out+curveComponent(system,{name:'adjust',data:config.home['adjust_'+system]});
                                 }
                                 if(out>10) out = 10;
                                 if(out<-10) out = -10;
