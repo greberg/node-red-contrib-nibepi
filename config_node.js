@@ -5934,6 +5934,50 @@ const checkTranslation = (node) => {
         await priceReleaseHwMode().catch(logCatch);
         await priceReleasePrioAdd().catch(logCatch);
     }
+    // Liveness for the Docker HEALTHCHECK, written once a minute: ts is when
+    // the file was written, lastData when the pump last sent a value (ms
+    // epoch, or null). Atomic via tmp + rename; skipped silently where
+    // /dev/shm is not writable (bare installs without tmpfs).
+    const HEALTH_FILE = '/dev/shm/nibepi-health.json';
+    let lastNibeData = null;
+    function writeHealth() {
+        let health = null;
+        if(typeof nibe.getHealth==='function') {
+            try { health = nibe.getHealth(); } catch(err) { health = null; }
+        }
+        if(health===null || typeof health!=='object') {
+            const conf = nibe.getConfig() || {};
+            health = {
+                core: (nibe.core!==undefined && nibe.core.connected===true) ? 'up' : 'down',
+                model: (conf.system && conf.system.pump) ? conf.system.pump : null,
+                lastData: null,
+                restarts: null,
+                busHealth: (typeof nibe.getBusHealth==='function') ? nibe.getBusHealth() : null
+            };
+        }
+        const times = [Number(health.lastData), Number(lastNibeData)].filter(t => Number.isFinite(t) && t>0);
+        const controllers = {};
+        for(const name of Object.keys(controllerStatus)) {
+            const c = controllerStatus[name];
+            controllers[name] = {ok:c.ok, lastRun:c.lastRun, lastError:c.lastError};
+        }
+        const out = {
+            ts: Date.now(),
+            core: health.core!==undefined ? health.core : null,
+            model: health.model!==undefined && health.model!=="" ? health.model : null,
+            lastData: times.length>0 ? Math.max(...times) : null,
+            restarts: health.restarts!==undefined ? health.restarts : null,
+            busHealth: health.busHealth!==undefined ? health.busHealth : null,
+            controllers: controllers
+        };
+        let json;
+        try { json = JSON.stringify(out); } catch(err) { return; }
+        const tmp = HEALTH_FILE+'.tmp';
+        fs.writeFile(tmp, json, (err) => {
+            if(err) return;
+            fs.rename(tmp, HEALTH_FILE, () => {});
+        });
+    }
     let adminRoutesRegistered = false;
     let adminHandleCore = null;
     function nibeConfig(n) {
@@ -5944,7 +5988,8 @@ const checkTranslation = (node) => {
             nibe.data.on(event, listener);
             nibeListeners.push([event, listener]);
         };
-        let healthTimer;
+        let healthTimer = setInterval(writeHealth, 60000);
+        writeHealth();
         var cron = require('node-cron');
         let config = nibe.getConfig();
         if(config.price===undefined) {
@@ -6202,6 +6247,7 @@ const checkTranslation = (node) => {
 
 
     onNibe('data',data => {
+        lastNibeData = Date.now();
         nibeData.emit(data.register,data);
         nibeData.emit('data',data);
         savedData[data.register] = data;
