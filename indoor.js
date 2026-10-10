@@ -49,7 +49,19 @@ module.exports = function(RED) {
                     arr.push(insideSensor);
                 }
             }
-            let nibe_enabled = await server.nibe.reqData(server.hP()["inside_enable_"+config.system]).catch(console.log);
+            let nibe_enabled;
+            try {
+                nibe_enabled = await server.nibe.reqData(server.hP()["inside_enable_"+config.system]);
+            } catch (err) {
+                if (err && err.message === 'Heatpump is not ready yet.') {
+                    // The core emits 'ready' when the serial port opens, before the
+                    // pump has announced its model. startUp() runs again on the
+                    // next 'ready', so wait quietly instead of logging a stack.
+                    node.status({ fill: 'yellow', shape: 'ring', text: 'Waiting for heat pump' });
+                    return;
+                }
+                node.warn(err && err.message ? err.message : String(err));
+            }
             if(nibe_enabled===undefined || nibe_enabled.data===undefined || nibe_enabled.data!==1 && conf.indoor['enable_'+config.system]!==true){ arr = [];}
                 server.initiatePlugin(arr,'indoor',config.system).then(data => {
                     node.status({ fill: 'green', shape: 'dot', text: `System ${system}` });
