@@ -59,6 +59,9 @@ module.exports = function(RED) {
         return mask;
     };
     const nibeData = new EventEmitter()
+    // Every input node adds a 'fault' listener and every plugin 'ready' and
+    // 'fault'; the count grows with the flow, not with a leak.
+    nibeData.setMaxListeners(0);
     const nibe = require('nibepi')
     // Replacement for .catch(console.log) on pump requests. Resolves to
     // undefined like before, but: stays quiet while the pump has not announced
@@ -2239,6 +2242,8 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
         }
         return Math.max(-10,Math.min(10,value));
     }
+    // What NibePi last wrote to curveadjust per system, for the safe state.
+    const curveWritten = {};
     const curveAdjust = (type,system,data) => {
         let curveadjust;
         if(hP!==undefined) {
@@ -2291,6 +2296,7 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                                     if(result.data!==(out)) {
                                         nibe.setData(curveadjust,out,(err,result) => {
                                             if(err) return console.log(err);
+                                            curveWritten[system] = out;
                                             let save = {
                                                 titel:"Curveadjustment",
                                                 register:'curveadjust',
@@ -2309,6 +2315,7 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                                     if(result.data!==(out)) {
                                         nibe.setData(curveadjust,out,(err,result) => {
                                             if(err) return console.log(err);
+                                            curveWritten[system] = out;
                                             let save = {
                                                 titel:"Curveadjustment",
                                                 register:'curveadjust',
@@ -5903,10 +5910,41 @@ const checkTranslation = (node) => {
 }
     console.log(text.starting)
 
+    // Neutral settings when NibePi stops (close on redeploy or shutdown), for
+    // what NibePi itself changed: the curve offset back to the user's fixed
+    // adjustment (home.adjust_sX, 0 when unset), hot water handed back to the
+    // pump, lock-frequency bands off, hw_mode and prioritised additive back.
+    async function safeState() {
+        if(hP===undefined || nibe.core===undefined || nibe.core.connected!==true) return;
+        const home = (nibe.getConfig() || {}).home || {};
+        for(const system of Object.keys(curveWritten)) {
+            const key = hP['curveadjust_'+system];
+            if(key===undefined) continue;
+            const fixed = Math.round(curveComponent(system,{name:'adjust',data:(home['adjust_'+system]!==undefined ? home['adjust_'+system] : 0)}));
+            if(curveWritten[system]===fixed) continue;
+            const err = await setDataAsync(key,fixed,4000);
+            if(err) {
+                nibe.log(`Kunde inte återställa kurvjustering (${system}): ${err}`,'system','error');
+            } else {
+                curveWritten[system] = fixed;
+            }
+        }
+        await vvHwRelease('NibePi stoppas').catch(logCatch);
+        await priceReleaseLockBands().catch(logCatch);
+        await priceReleaseHwMode().catch(logCatch);
+        await priceReleasePrioAdd().catch(logCatch);
+    }
     let adminRoutesRegistered = false;
     let adminHandleCore = null;
     function nibeConfig(n) {
         RED.nodes.createNode(this,n);
+        // Listeners on the backend's emitter, kept so close removes only these.
+        const nibeListeners = [];
+        const onNibe = (event, listener) => {
+            nibe.data.on(event, listener);
+            nibeListeners.push([event, listener]);
+        };
+        let healthTimer;
         var cron = require('node-cron');
         let config = nibe.getConfig();
         if(config.price===undefined) {
@@ -6151,7 +6189,7 @@ const checkTranslation = (node) => {
             }
         })
 
-    nibe.data.on('config',data => {
+    onNibe('config',data => {
         if(timer.config!==undefined && timer.config._idleTimeout>0) {
             clearTimeout(timer.config);
         }
@@ -6163,18 +6201,18 @@ const checkTranslation = (node) => {
     })
 
 
-    nibe.data.on('data',data => {
+    onNibe('data',data => {
         nibeData.emit(data.register,data);
         nibeData.emit('data',data);
         savedData[data.register] = data;
         saveDataGraph(data.register,Date.now(),data.raw_data)
         //console.log(`${data.register}, ${data.titel}: ${data.data} ${data.unit}`)
     })
-    nibe.data.on('mqttData',data => {
+    onNibe('mqttData',data => {
         saveDataGraph(data.register,data.timestamp,data.raw_data,true)
     })
     var rmu_ready = false;
-    nibe.data.on('rmu_ready',data => {
+    onNibe('rmu_ready',data => {
         rmu_ready = true;
         nibeData.emit('rmu_ready',data);
     });
@@ -6184,11 +6222,11 @@ const checkTranslation = (node) => {
     // RS485 bus health, once a minute from the backend. Exposed as the
     // 'bus_health' register so a nibe-input node named bus_health can show
     // it, and in global context for function nodes.
-    nibe.data.on('busHealth',data => {
+    onNibe('busHealth',data => {
         nibeData.emit('bus_health',{register:'bus_health',data:data.errors,unit:' fel/min',raw_data:data,timestamp:data.timestamp});
         this.context().global.set('bus_health', data);
     })
-    nibe.data.on('updateSensor',data => {
+    onNibe('updateSensor',data => {
         // Restart plugins so they pick up the changed sensor list - but only
         // once the pump is connected. nibe.core is set when the pump has
         // announced its model; MQTT usually connects before that, and the real
@@ -6196,7 +6234,7 @@ const checkTranslation = (node) => {
         if(nibe.core===undefined || nibe.core.connected!==true) return;
         nibeData.emit('ready',true);
     })
-        nibe.data.on('fault',data => {
+        onNibe('fault',data => {
             if(data.from=="core") {
                 sendError(data.from,data.message);
                 nibe.core = undefined;
@@ -6228,15 +6266,35 @@ const checkTranslation = (node) => {
         this.hP = gethP;
         this.checkReady = checkReady;
         this.translate = translate;
-        this.on('close', function() {
+        this.clearList = clearList;
+        this.on('close', function(removed, done) {
             console.log('Closing listeners');
-            nibeData.removeAllListeners();
-            nibe.data.removeAllListeners();
             everyminute.stop();
             threeminutes.stop();
             tenminutes.stop();
             hourly.stop();
-            clearTimeout(timer.diagnostic);
+            if(healthTimer!==undefined) clearInterval(healthTimer);
+            // All timers, including a pending curve write that would otherwise
+            // land after the safe state.
+            for(const key of Object.keys(timer)) {
+                clearTimeout(timer[key]);
+            }
+            nibeData.removeAllListeners();
+            // Only this node's listeners: removeAllListeners() on the backend's
+            // emitter also dropped its own pending reqData and ACK listeners.
+            for(const [event, listener] of nibeListeners) {
+                nibe.data.removeListener(event, listener);
+            }
+            nibeListeners.length = 0;
+            // Bounded: never hold up a redeploy or shutdown for long.
+            let closeTimeout;
+            Promise.race([
+                safeState().catch(logCatch),
+                new Promise(resolve => { closeTimeout = setTimeout(resolve, 8000); })
+            ]).then(() => {
+                clearTimeout(closeTimeout);
+                done();
+            });
         });
     }
 
