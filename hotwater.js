@@ -1,18 +1,13 @@
 
+const { subscriber } = require('./node_util');
 module.exports = function(RED) {
      function nibeHotwater(config) {
         RED.nodes.createNode(this,config);
         const server = RED.nodes.getNode(config.server);
-        // Track this node's own subscriptions so close() can release exactly
-        // those. They were previously either never removed (leaking on every
-        // redeploy) or cleared with removeAllListeners(), which also wiped every
-        // other node's subscriptions from the shared emitter.
-        const __subs = [];
-        const sub = (ev, fn) => { __subs.push([ev, fn]); server.nibeData.on(ev, fn); return fn; };
-        this.on('close', function() {
-            for (const s of __subs) server.nibeData.removeListener(s[0], s[1]);
-            __subs.length = 0;
-        });
+        // Subscriptions to the shared emitter: released on close, and a handler
+        // exception is reported on this node instead of propagating into the
+        // config node's emit() (see node_util.js).
+        const sub = subscriber(this, server);
         const startUp = () => {
             const arr = [
                 //{topic:"bt6",source:"nibe"},
@@ -64,22 +59,23 @@ module.exports = function(RED) {
         })
         sub('pluginHotwaterAutoLuxury', (value) => {
             if(value.bt7!==undefined && value.bt7.data>-3276) {
+                const bt6 = value.bt6!==undefined ? value.bt6.data : undefined;
                 this.send({topic:"BT7 Topp",payload:value.bt7.data})
-                this.send({topic:"BT6 Laddning",payload:value.bt6.data})
+                if(bt6!==undefined) this.send({topic:"BT6 Laddning",payload:bt6})
                 if(value.hwTriggerTemp!==undefined) this.send({topic:"Startvärde",payload:value.hwTriggerTemp})
                 if(value.hwTargetValue!==undefined) {
                     this.send({topic:"Stoppvärde",payload:value.hwTargetValue});
-                } else {
-                    this.send({topic:"Stoppvärde",payload:value.bt6.data});
+                } else if(bt6!==undefined) {
+                    this.send({topic:"Stoppvärde",payload:bt6});
                 }
             }
     })
         sub('pluginHotwaterPriority', (value) => {
                 if(value.bt7!==undefined && value.bt7.data>-3276) {
                     this.send([null,{topic:"BT7 Topp",payload:value.bt7.data}])
-                    this.send([null,{topic:"BT6 Laddning",payload:value.bt6.data}])
-                    this.send([null,{topic:"Startvärde",payload:value.hwStartTemp.data}])
-                    this.send([null,{topic:"Stoppvärde",payload:value.hwStopTemp.data}])
+                    if(value.bt6!==undefined) this.send([null,{topic:"BT6 Laddning",payload:value.bt6.data}])
+                    if(value.hwStartTemp!==undefined) this.send([null,{topic:"Startvärde",payload:value.hwStartTemp.data}])
+                    if(value.hwStopTemp!==undefined) this.send([null,{topic:"Stoppvärde",payload:value.hwStopTemp.data}])
                     
                 }
         })

@@ -1,18 +1,13 @@
 
+const { subscriber } = require('./node_util');
 module.exports = function(RED) {
     function nibeGraph(config) {
         RED.nodes.createNode(this,config);
         const server = RED.nodes.getNode(config.server);
-        // Track this node's own subscriptions so close() can release exactly
-        // those. They were previously either never removed (leaking on every
-        // redeploy) or cleared with removeAllListeners(), which also wiped every
-        // other node's subscriptions from the shared emitter.
-        const __subs = [];
-        const sub = (ev, fn) => { __subs.push([ev, fn]); server.nibeData.on(ev, fn); return fn; };
-        this.on('close', function() {
-            for (const s of __subs) server.nibeData.removeListener(s[0], s[1]);
-            __subs.length = 0;
-        });
+        // Subscriptions to the shared emitter: released on close, and a handler
+        // exception is reported on this node instead of propagating into the
+        // config node's emit() (see node_util.js).
+        const sub = subscriber(this, server);
         let node = this;
         let timeFrame;
         let translate = server.translate.dash;
@@ -87,8 +82,14 @@ module.exports = function(RED) {
         function updateData() {
             let systems = server.systems();
             let conf = server.config;
+            if(conf===undefined || conf===null) return;
+            // Plugin categories only exist once their node has run once.
+            const indoor = conf.indoor || {};
+            const fan = conf.fan || {};
+            const pump = conf.system!==undefined ? conf.system.pump : undefined;
             if(conf.data===undefined || conf.data.graph===undefined) {
-                conf.data = {graph:[]};
+                // Keep any other conf.data keys.
+                conf.data = Object.assign({}, conf.data, {graph:[]});
                 server.nibe.setConfig(conf)
             }
             if(config.select=="datagraph") {
@@ -128,12 +129,12 @@ module.exports = function(RED) {
                     {name:"Inomhustemperatur",register:['indoor_sensor_'+config.system]},
                     {name:"Inomhusbörvärde",register:server.hP()['inside_set_'+config.system]}
                 ]
-                if(conf.indoor['enable_'+config.system]===true) {
+                if(indoor['enable_'+config.system]===true) {
                     arr.push({name:"Kurvjustering",register:['indoor_offset_'+config.system]});
                 }
                 node.send({graph:config.select,payload:buildGraph(arr)});
             } else if(config.select=="diagnostic_defrost") {
-                if(conf.system.pump!==undefined && (conf.system.pump=="F730" || conf.system.pump=="F750")) {
+                if(pump=="F730" || pump=="F750") {
                     let arr = [
                         {name:"Gångtid (m)",register:"cpr_runtime"},
                         {name:"Avfrostningstid (m)",register:"defrosting"}
@@ -143,7 +144,7 @@ module.exports = function(RED) {
                     node.send({graph:config.select,enabled:false});
                 }
             } else if(config.select=="efficiency_graph") {
-                if(conf.system.pump!==undefined && (conf.system.pump=="F730" || conf.system.pump=="F750")) {
+                if(pump=="F730" || pump=="F750") {
                     let arr = [
                         {name:"Gångtid (%)",register:"cpr_uptime",chart:"pie"},
                         {name:"Avfrostningstid (%)",register:"cpr_downtime",chart:"pie"}
@@ -180,12 +181,12 @@ module.exports = function(RED) {
                     {name:"Kompressorfrekvens",register:server.hP()['cpr_act']},
                     {name:"Förångartemperatur",register:server.hP()['evaporator']}
                 ]
-                if(conf.fan.enable_co2===true) {
+                if(fan.enable_co2===true) {
                     arr.push({name:"CO2",register:['fan_co2Sensor']});
                     arr.push({name:"CO2 Gränsvärde för sänkt flöde",register:['fan_low_co2_limit']});
                     arr.push({name:"CO2 Gränsvärde för ökat flöde",register:['fan_high_co2_limit']});
                 }
-                if(conf.fan.enable_filter===true) {
+                if(fan.enable_filter===true) {
                     arr.push({name:"Filtereffektivitet",register:['filter_eff']});
                 }
                 node.send({graph:config.select,payload:buildGraph(arr)});
@@ -231,9 +232,10 @@ module.exports = function(RED) {
             }
         })
         function buildRegisterList() {
-            let conf = server.config;
+            let conf = server.config || {};
             let savedData = server.savedData();
             var list = [];
+            const registers = Array.isArray(conf.registers) ? conf.registers : [];
             let icons = {
                 "":"fa-bars",
                 "°C":"fa-thermometer-three-quarters",
@@ -248,7 +250,7 @@ module.exports = function(RED) {
                 "%RH":"fa-cloud",
                 "%":"fa-percent"
             }
-            for( var n = 0; n < conf.registers.length; n++){
+            for( var n = 0; n < registers.length; n++){
                 if(savedData[conf.registers[n]]!==undefined) {
                     let register = {};
                     register.title = `${savedData[conf.registers[n]].register}, ${savedData[conf.registers[n]].titel}`;

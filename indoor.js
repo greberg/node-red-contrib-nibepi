@@ -1,19 +1,14 @@
 
+const { subscriber } = require('./node_util');
 module.exports = function(RED) {
     function nibeIndoor(config) {
         RED.nodes.createNode(this,config);
         let node = this;
         const server = RED.nodes.getNode(config.server);
-        // Track this node's own subscriptions so close() can release exactly
-        // those. They were previously either never removed (leaking on every
-        // redeploy) or cleared with removeAllListeners(), which also wiped every
-        // other node's subscriptions from the shared emitter.
-        const __subs = [];
-        const sub = (ev, fn) => { __subs.push([ev, fn]); server.nibeData.on(ev, fn); return fn; };
-        this.on('close', function() {
-            for (const s of __subs) server.nibeData.removeListener(s[0], s[1]);
-            __subs.length = 0;
-        });
+        // Subscriptions to the shared emitter: released on close, and a handler
+        // exception is reported on this node instead of propagating into the
+        // config node's emit() (see node_util.js).
+        const sub = subscriber(this, server);
         async function startUp() {
             let system = config.system.replace('s','S');
             let conf = server.nibe.getConfig();
@@ -115,7 +110,7 @@ module.exports = function(RED) {
                 if(data.indoorOffset!==undefined) {
                     node.send({topic:"Kurvjustering",payload:data.indoorOffset});
                 }
-                node.send({topic:"Tid",payload:outside.timestamp});
+                if(outside!==undefined) node.send({topic:"Tid",payload:outside.timestamp});
                 node.send({topic:"Avvikelse",payload:data.accuracy});
             }
         })

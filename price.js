@@ -1,17 +1,12 @@
+const { subscriber } = require('./node_util');
 module.exports = function(RED) {
     function nibePrice(config) {
         RED.nodes.createNode(this,config);
         const server = RED.nodes.getNode(config.server);
-        // Track this node's own subscriptions so close() can release exactly
-        // those. They were previously either never removed (leaking on every
-        // redeploy) or cleared with removeAllListeners(), which also wiped every
-        // other node's subscriptions from the shared emitter.
-        const __subs = [];
-        const sub = (ev, fn) => { __subs.push([ev, fn]); server.nibeData.on(ev, fn); return fn; };
-        this.on('close', function() {
-            for (const s of __subs) server.nibeData.removeListener(s[0], s[1]);
-            __subs.length = 0;
-        });
+        // Subscriptions to the shared emitter: released on close, and a handler
+        // exception is reported on this node instead of propagating into the
+        // config node's emit() (see node_util.js).
+        const sub = subscriber(this, server);
         const startUp = () => {
             let system = config.system.replace('s','S');
             let conf = server.nibe.getConfig();
@@ -108,14 +103,16 @@ module.exports = function(RED) {
         });
         sub('pluginPrice', (data) => {
             if(data.system===config.system) {
+                // Any of these can be missing when the price source failed.
+                const v = (r) => (r!==undefined && r!==null) ? r.data : undefined;
                 if(data.price_level===undefined) {
-                    this.send({topic:"Nuvarande Elprisnivå",payload:data.heat_price_level.data});
-                    this.send({topic:"Nuvarande Elprisnivå (VV)",payload:data.hw_price_level.data});
-                    this.send({topic:"Nuvarande Elpris",payload:data.price_current.data});
+                    if(v(data.heat_price_level)!==undefined) this.send({topic:"Nuvarande Elprisnivå",payload:v(data.heat_price_level)});
+                    if(v(data.hw_price_level)!==undefined) this.send({topic:"Nuvarande Elprisnivå (VV)",payload:v(data.hw_price_level)});
+                    if(v(data.price_current)!==undefined) this.send({topic:"Nuvarande Elpris",payload:v(data.price_current)});
                     this.send([null,{topic:"test",payload:data}]);
                 } else {
-                    this.send({topic:"Nuvarande Elprisnivå",payload:data.price_level.data});
-                    this.send({topic:"Nuvarande Elpris",payload:data.price_current.data});
+                    if(v(data.price_level)!==undefined) this.send({topic:"Nuvarande Elprisnivå",payload:v(data.price_level)});
+                    if(v(data.price_current)!==undefined) this.send({topic:"Nuvarande Elpris",payload:v(data.price_current)});
                     this.send([null,{topic:"test",payload:data}]);
                 }
             }

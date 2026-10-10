@@ -1,3 +1,4 @@
+const { subscriber } = require('./node_util');
 module.exports = function (RED) {
     "use strict";
 
@@ -21,19 +22,12 @@ module.exports = function (RED) {
 
         // Frsk koppla mot nibe-config s vi kan lyssna p backend-eventet
         const server = RED.nodes.getNode(config.server);
-        // Track this node's own subscriptions so close() can release exactly
-        // those. They were previously either never removed (leaking on every
-        // redeploy) or cleared with removeAllListeners(), which also wiped every
-        // other node's subscriptions from the shared emitter.
-        const __subs = [];
-        const sub = (ev, fn) => { __subs.push([ev, fn]); server.nibeData.on(ev, fn); return fn; };
-        this.on('close', function() {
-            for (const s of __subs) server.nibeData.removeListener(s[0], s[1]);
-            __subs.length = 0;
-        });
         let backendListener = null;
 
         if (server && server.nibeData && typeof server.nibeData.on === "function") {
+            // Released on close; handler exceptions are reported on this node
+            // instead of propagating into the config node's emit().
+            const sub = subscriber(node, server);
             backendListener = function (vvAi) {
                 // vvAi = VV-AI-paketet frn backend (profil, BT6/BT7, min-temp, preheat osv.)
                 const msg = {
@@ -171,14 +165,7 @@ module.exports = function (RED) {
         });
 
         node.on("close", function (removed, done) {
-            if (
-                backendListener &&
-                server &&
-                server.nibeData &&
-                typeof server.nibeData.removeListener === "function"
-            ) {
-                server.nibeData.removeListener("pluginHotwaterAI", backendListener);
-            }
+            // The subscription itself is released by subscriber().
             if (done) done();
         });
     }

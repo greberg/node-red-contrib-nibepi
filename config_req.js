@@ -1,18 +1,16 @@
+const { subscriber } = require('./node_util');
 module.exports = function(RED) {
     function nibeRequest(config) {
         RED.nodes.createNode(this,config);
         this.server = RED.nodes.getNode(config.server);
-        // Track this node's own subscriptions so close() can release exactly
-        // those. They were previously either never removed (leaking on every
-        // redeploy) or cleared with removeAllListeners(), which also wiped every
-        // other node's subscriptions from the shared emitter.
-        const __server = this.server;
-        const __subs = [];
-        const sub = (ev, fn) => { __subs.push([ev, fn]); __server.nibeData.on(ev, fn); return fn; };
-        this.on('close', function() {
-            for (const s of __subs) __server.nibeData.removeListener(s[0], s[1]);
-            __subs.length = 0;
-        });
+        if (!this.server) {
+            this.status({ fill: 'red', shape: 'dot', text: `No configuration node configured` });
+            return;
+        }
+        // Subscriptions to the shared emitter: released on close, and a handler
+        // exception is reported on this node instead of propagating into the
+        // config node's emit() (see node_util.js).
+        const sub = subscriber(this, this.server);
         let nibe = this.server.nibe;
         let translate = this.server.translate;
         function getInfo(data,node,msg={}) {

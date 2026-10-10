@@ -1,18 +1,13 @@
 
+const { subscriber } = require('./node_util');
 module.exports = function(RED) {
      function nibeWeather(config) {
         RED.nodes.createNode(this,config);
         const server = RED.nodes.getNode(config.server);
-        // Track this node's own subscriptions so close() can release exactly
-        // those. They were previously either never removed (leaking on every
-        // redeploy) or cleared with removeAllListeners(), which also wiped every
-        // other node's subscriptions from the shared emitter.
-        const __subs = [];
-        const sub = (ev, fn) => { __subs.push([ev, fn]); server.nibeData.on(ev, fn); return fn; };
-        this.on('close', function() {
-            for (const s of __subs) server.nibeData.removeListener(s[0], s[1]);
-            __subs.length = 0;
-        });
+        // Subscriptions to the shared emitter: released on close, and a handler
+        // exception is reported on this node instead of propagating into the
+        // config node's emit() (see node_util.js).
+        const sub = subscriber(this, server);
         let system = config.system.replace('s','S');
         const startUp = () => {
             this.status({ fill: 'yellow', shape: 'dot', text: `System ${system}` });
@@ -86,7 +81,7 @@ module.exports = function(RED) {
             if(data.system===config.system) {
                 let outside = data['outside'];
                 //server.nibeData.emit('forecast_1',arr,config.system);
-                this.send({topic:"Utomhustemperatur",payload:outside.data});
+                if(outside!==undefined) this.send({topic:"Utomhustemperatur",payload:outside.data});
                 this.send({topic:"Kurvjustering",payload:data.weatherOffset});
                 //if(data.predictedNow!==undefined) this.send({topic:"Nuvarande prognos",payload:data.predictedNow.payload,timestamp:data.predictedNow.timestamp});
                 if(data.predictedLater!==undefined) this.send({topic:"Prognos",payload:data.predictedLater.payload,timestamp:data.predictedLater.timestamp});
