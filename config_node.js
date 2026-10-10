@@ -77,6 +77,43 @@ module.exports = function(RED) {
         logCatchSeen.set(msg, { at: now, skipped: 0 });
         RED.log.warn(`[nibepi] ${msg}${skipped}`);
     };
+    // Every scheduled job and controller runs through safeRun. A throw or a
+    // rejection used to become an unhandled rejection, and inside updateData
+    // it skipped the remaining controllers and systems. The outcome per name
+    // is kept for the health file; errors are reported at most every 10 min.
+    const controllerStatus = {};
+    const safeRunSeen = new Map();
+    const safeRun = async (name, fn) => {
+        const status = controllerStatus[name] || (controllerStatus[name] = {ok:true, lastRun:null, lastError:null});
+        try {
+            const result = await fn();
+            status.ok = true;
+            status.lastRun = Date.now();
+            return result;
+        } catch(err) {
+            const msg = err && err.message ? err.message : String(err);
+            status.ok = false;
+            status.lastRun = Date.now();
+            status.lastError = msg;
+            if(msg === 'Heatpump is not ready yet.') return;
+            const key = name+'|'+msg;
+            const now = Date.now();
+            const seen = safeRunSeen.get(key);
+            if(seen !== undefined && now - seen < 600000) return;
+            safeRunSeen.set(key, now);
+            RED.log.warn(`[nibepi] ${name}: ${err && err.stack ? err.stack : msg}`);
+            nibe.log(`${name} avbröts av ett fel: ${msg}`,'system','error');
+        }
+    };
+    // Listeners in the plugin nodes (graph.js and others) run synchronously
+    // inside emit; one that throws must not abort the caller.
+    const emitSafe = (event, data) => {
+        try {
+            nibeData.emit(event, data);
+        } catch(err) {
+            logCatch(err);
+        }
+    };
     var serialPort = "";
     var tcp_host = "";
     var tcp_port = "";
@@ -2414,7 +2451,36 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
     });
     return promise;
 }
+    // updateData is started by the 3-minute job, the hourly job (both at :00)
+    // and by every plugin on 'ready'. Overlapping runs raced on the same pump
+    // registers and controller state, so runs are serialized: a call during a
+    // run queues one follow-up run (hourly if any caller asked for hourly, so
+    // the weather forecast is never skipped). A run that has hung for 10
+    // minutes no longer blocks new ones.
+    let updateDataRunning = false;
+    let updateDataStarted = 0;
+    let updateDataQueued = null;
     async function updateData(hourly=false) {
+        hourly = (hourly===true);
+        if(updateDataRunning && Date.now()-updateDataStarted < 600000) {
+            updateDataQueued = {hourly: hourly || (updateDataQueued!==null && updateDataQueued.hourly)};
+            return;
+        }
+        updateDataRunning = true;
+        updateDataStarted = Date.now();
+        const started = updateDataStarted;
+        try {
+            await safeRun('updateData', () => updateDataRun(hourly));
+        } finally {
+            if(updateDataStarted===started) updateDataRunning = false;
+        }
+        if(!updateDataRunning && updateDataQueued!==null) {
+            const next = updateDataQueued;
+            updateDataQueued = null;
+            await updateData(next.hourly);
+        }
+    }
+    async function updateDataRun(hourly) {
         let timeNow = Date.now();
         /*
         Check emitters
@@ -2425,6 +2491,8 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
             console.log(`Eventname: ${item}, Count: ${count}`);
         }*/
         for (const item of getList) {
+            // One failing system or controller must not skip the others.
+            await safeRun('updateData_'+item.system, async () => {
             const array = [];
             let result = {timestamp:timeNow};
             result.system = item.system;
@@ -2480,19 +2548,20 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                     }
                 }
             }
-            runIndoor(result,array);
-            runPrice(result,array);
-            runRMU(result,array);
+            await safeRun('runIndoor_'+item.system, () => runIndoor(result,array));
+            await safeRun('runPrice_'+item.system, () => runPrice(result,array));
+            await safeRun('runRMU_'+item.system, () => runRMU(result,array));
+            result.array = array;
             if(hourly===true) {
-                result.array = array;
-                runWeather(result);
+                await safeRun('runWeather_'+item.system, () => runWeather(result));
             } else {
-                result.array = array;
-                if(nibe.getConfig().weather['enable_'+item.system]===true) {
-                    nibeData.emit('pluginWeather',result);
+                const weatherConf = nibe.getConfig().weather || {};
+                if(weatherConf['enable_'+item.system]===true) {
+                    emitSafe('pluginWeather',result);
                 }
             }
-            nibeData.emit('updateGraph');
+            emitSafe('updateGraph');
+            });
         }
       }
         const checkWind = (array,hours) => {
@@ -5634,11 +5703,12 @@ const checkTranslation = (node) => {
 
         var everyminute = cron.schedule('*/1 * * * *', () => {
             if(nibe.core!==undefined && nibe.core.connected!==undefined && nibe.core.connected===true) {
-                nibeData.emit('updateGraph');
-                minuteUpdate();
-                hotwaterPlugin();
-                vvAiTick();
-                runFan()
+                Promise.all([
+                    safeRun('minuteUpdate', minuteUpdate),
+                    safeRun('hotwaterPlugin', hotwaterPlugin),
+                    safeRun('vvAiTick', vvAiTick),
+                    safeRun('runFan', runFan)
+                ]).then(() => emitSafe('updateGraph'));
             }
 
         })
@@ -5650,7 +5720,7 @@ const checkTranslation = (node) => {
         })
         var tenminutes = cron.schedule('*/10 * * * *', () => {
             if(nibe.core!==undefined && nibe.core.connected!==undefined && nibe.core.connected===true) {
-                tenMinuteUpdate()
+                safeRun('tenMinuteUpdate', tenMinuteUpdate);
             }
         })
 
