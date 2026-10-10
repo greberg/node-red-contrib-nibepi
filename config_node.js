@@ -5903,6 +5903,8 @@ const checkTranslation = (node) => {
 }
     console.log(text.starting)
 
+    let adminRoutesRegistered = false;
+    let adminHandleCore = null;
     function nibeConfig(n) {
         RED.nodes.createNode(this,n);
         var cron = require('node-cron');
@@ -6051,15 +6053,34 @@ const checkTranslation = (node) => {
 
         }));
 
-        RED.httpAdmin.post("/config/:id", RED.auth.needsPermission("nibe-config.write"), function(req, res) {
-            nibe.setConfig(req.body.config);
-            handleCore(req.body.config);
-            nibeData.emit(req.params.id,req.body.data);
-            //handleMQTT(req.body);
-        });
-        RED.httpAdmin.get('/config', function(req, res) {
-            res.json(nibe.getConfig());
-        });
+        // The admin routes are registered once per process: re-registering
+        // on every redeploy stacked handlers, each with a stale node closure.
+        // They act on the most recently started config node.
+        adminHandleCore = handleCore;
+        if(adminRoutesRegistered!==true) {
+            adminRoutesRegistered = true;
+            const isPlainObject = (v) => v!==null && typeof v==='object' && !Array.isArray(v);
+            RED.httpAdmin.post("/config/:id", RED.auth.needsPermission("nibe-config.write"), function(req, res) {
+                // The whole config is replaced, so refuse anything that is not
+                // a config object, and always answer (the request used to hang).
+                if(!isPlainObject(req.body) || !isPlainObject(req.body.config)) {
+                    return res.status(400).json({error:'Ogiltig konfiguration'});
+                }
+                try {
+                    nibe.setConfig(req.body.config);
+                    if(adminHandleCore!==null) adminHandleCore(req.body.config);
+                    emitSafe(req.params.id,req.body.data);
+                    res.json({ok:true});
+                } catch(err) {
+                    res.status(500).json({error:err && err.message ? err.message : String(err)});
+                }
+                //handleMQTT(req.body);
+            });
+            // Includes secrets (Tibber token, MQTT password): needs read permission.
+            RED.httpAdmin.get('/config', RED.auth.needsPermission("nibe-config.read"), function(req, res) {
+                res.json(nibe.getConfig());
+            });
+        }
         async function saveGraph() {
             const promise = new Promise((resolve,reject) => {
                 let config = nibe.getConfig();
