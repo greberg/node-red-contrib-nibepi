@@ -2047,6 +2047,23 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
     const isMissingValue = (value) => {
         return value === undefined || value === null || value === 9999 || value === 9999.0 || value === '9999';
     }
+    // MQTT sensor staleness, config.home.sensor_timeout in minutes. Unset or ""
+    // used to mean "never stale", so a dead sensor kept steering the curve with
+    // its last value; it now means the 60 minute default. 0 is the documented
+    // opt-out and still disables the check.
+    const sensorIsStale = (timestamp,now) => {
+        const conf = nibe.getConfig() || {};
+        const raw = (conf.home!==undefined) ? conf.home.sensor_timeout : undefined;
+        let minutes = 60;
+        if(raw!==undefined && raw!==null && raw!=="") {
+            const value = Number(raw);
+            if(value===0) return false;
+            if(Number.isFinite(value) && value>0) minutes = value;
+        }
+        const ts = Number(timestamp);
+        if(!Number.isFinite(ts)) return true;
+        return now>ts+(minutes*60000);
+    }
     const getTimeString = (timeSeries) => {
         if(timeSeries === undefined || timeSeries === null) return undefined;
         return timeSeries.validTime || timeSeries.time;
@@ -2507,20 +2524,7 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                     if(item.registers[i].source=="mqtt") {
                         await nibe.getMQTTData(item.registers[i].register).then(atad => {
                             let data = Object.assign({}, atad);
-                            let config = nibe.getConfig();
-                            let sensor_timeout;
-                            if(config.home===undefined) {
-                                config.home = {};
-                                nibe.setConfig(config);
-                            }
-                            if(config.home.sensor_timeout!==undefined && config.home.sensor_timeout!=="" && config.home.sensor_timeout!==0) {
-                                sensor_timeout = data.timestamp+(config.home.sensor_timeout*60000);
-                            } else if(config.home.sensor_timeout===0 || config.home.sensor_timeout===undefined || config.home.sensor_timeout==="") {
-                                sensor_timeout = timeNow;
-                            } else {
-                                sensor_timeout = data.timestamp+(60*60000);
-                            }
-                            if(timeNow>sensor_timeout) {
+                            if(sensorIsStale(data.timestamp,timeNow)) {
                                 sendError(text.extra_sensor,`${text.extra_sensor} ${item.registers[i].name} ${text.not_updated}`)
                             } else {
                                 data.system = item.system;
@@ -4979,18 +4983,7 @@ async function runFanOrginal() {
             await nibe.getMQTTData(data.co2Sensor.register).then(atad => {
                 let result = Object.assign({}, atad);
                 nibe.log('Data från CO2 givare\n',result.data,'fan','debug');
-                let sensor_timeout;
-                if(config.home.sensor_timeout!==undefined && config.home.sensor_timeout!=="") {
-                    sensor_timeout = result.timestamp+(config.home.sensor_timeout*60000);
-                    nibe.log('Timeout vald för sensor, tid:'+config.home.sensor_timeout+" minuter",'fan','debug');
-                } else if(config.home.sensor_timeout===0) {
-                    sensor_timeout = timeNow;
-                    nibe.log('Timeout är avvaktiverad för sensor','fan','debug');
-                } else {
-                    sensor_timeout = result.timestamp+(60*60000);
-                    nibe.log('Timeout ej vald, sätter standard tid 60 minuter','fan','debug');
-                }
-                if(timeNow>sensor_timeout) {
+                if(sensorIsStale(result.timestamp,timeNow)) {
                     nibe.log(`CO2 givare ${data.co2Sensor.name} har inte uppdaterats. Ignorerar.`,'fan','error');
                 } else {
                     nibe.log(`CO2 givare ${data.co2Sensor.name} värde:${result.data}`,'fan','debug');
