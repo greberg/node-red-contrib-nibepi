@@ -34,6 +34,23 @@ module.exports = function(RED) {
                     }
                   
                 } else {
+                    // The shared flows carry request nodes for every model (e.g. the
+                    // energy meters 43144/43305 that the F1255 lacks). When the
+                    // register table is loaded and doesn't have this register, pass
+                    // the message on at once instead of firing a request that can
+                    // only fail and then waiting 30 s for the timeout below.
+                    const table = nibe.getRegister();
+                    const conf = nibe.getConfig();
+                    const testmode = conf!==undefined && conf.system!==undefined && conf.system.testmode===true;
+                    if(!testmode && Array.isArray(table) && table.length>0 && !table.some(r => r.register == register)) {
+                        if(absentReported===false) {
+                            absentReported = true;
+                            RED.log.debug(`[nibepi] Register ${register} (${config.name}) is not available on this heat pump model`);
+                        }
+                        this.status({ fill: 'grey', shape: 'ring', text: `Not on this model` });
+                        this.send(msg);
+                        return;
+                    }
                     if(reqOn===false) {
                         reqOn = true;
                         this.status({ fill: 'yellow', shape: 'dot', text: `Requesting data` });
