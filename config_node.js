@@ -105,6 +105,25 @@ module.exports = function(RED) {
             nibe.log(`${name} avbröts av ett fel: ${msg}`,'system','error');
         }
     };
+    // nibe.setData as a promise that always settles, with the callback's error
+    // (null on success) or a timeout error. For writes whose outcome matters:
+    // restores and the safe state on close.
+    const setDataAsync = (register, value, timeoutMs = 10000) => new Promise((resolve) => {
+        let settled = false;
+        let timeout;
+        const finish = (err) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
+            resolve(err || null);
+        };
+        timeout = setTimeout(() => finish(new Error('Timeout')), timeoutMs);
+        try {
+            nibe.setData(register, value, (err) => finish(err));
+        } catch (err) {
+            finish(err);
+        }
+    });
     // Listeners in the plugin nodes (graph.js and others) run synchronously
     // inside emit; one that throws must not abort the caller.
     const emitSafe = (event, data) => {
@@ -205,6 +224,59 @@ module.exports = function(RED) {
     let vvTickRunning = false;
 
     let vvLastAiControl = false;
+    // hw_period (47134) ownership. VV-AI control, the schedule and the min-temp
+    // floor hold hw_period at 0 and start hot water themselves with startHW=4.
+    // When none of them runs any more, the user's period has to come back or
+    // the pump makes no hot water at all. The flag lives in config.hotwater so
+    // a pending restore survives a restart.
+    const VV_SENSOR_FAIL_LIMIT = 5;
+    let vvSensorFailCount = 0;
+    function vvHwPeriodOwned() {
+        const c = nibe.getConfig() || {};
+        return !!(c.hotwater && c.hotwater.vv_hw_period_owned === true);
+    }
+    function vvSetHwPeriodOwned(owned) {
+        const c = nibe.getConfig() || {};
+        c.hotwater = c.hotwater || {};
+        if (c.hotwater.vv_hw_period_owned !== owned) {
+            c.hotwater.vv_hw_period_owned = owned;
+            nibe.setConfig(c);
+        }
+    }
+    function vvHwPeriodBaseline() {
+        const h = (nibe.getConfig() || {}).hotwater || {};
+        for (const v of [h.vv_backup_hw_period, h.vv_backup_hw_period_schedule]) {
+            const n = Number(v);
+            if (Number.isFinite(n) && n > 0) return n;
+        }
+        return 20;
+    }
+    // Hands hot water back to the pump: ends a startHW=4 that NibePi sent and
+    // restores hw_period if NibePi changed it. A failed write keeps ownership,
+    // so the next tick tries again.
+    async function vvHwRelease(why) {
+        if (hP === undefined) return;
+        const startHWKey = hP['startHW'];
+        const hwPeriodKey = hP['hw_period'];
+        const meta = (vvAiStore && vvAiStore.meta) ? vvAiStore.meta : null;
+        if (startHWKey && meta && Number(meta.vvStartHWLast) === 4) {
+            const err = await setDataAsync(startHWKey, 0);
+            if (!err) {
+                meta.vvStartHWLast = 0;
+                meta.lastStartHWWriteTs = Date.now();
+            }
+        }
+        if (hwPeriodKey && vvHwPeriodOwned()) {
+            const base = vvHwPeriodBaseline();
+            const err = await setDataAsync(hwPeriodKey, base);
+            if (err) {
+                nibe.log(`VV-AI: ${why}, kunde inte återställa hw_period: ${err}`, 'hotwater', 'error');
+                return;
+            }
+            vvSetHwPeriodOwned(false);
+            nibe.log(`VV-AI: ${why}, återställer hw_period till ${base}`, 'hotwater', 'info');
+        }
+    }
     let vvManualHwMode = null;
     let vvManualHwPeriod = null;
     let vvLastManualSchedule = false; // tidsstyrning VV – tidigare läge (on/off)
@@ -1276,7 +1348,12 @@ async function vvAiTick() {
 
             // Om varken VV-AI, tidsstyrning eller VV-AI-styrning är aktiverad
             // och vi inte har en pågående tidsstyrning att städa upp efter, gör vi ingenting.
+            // ...unless hw_period or startHW is still ours to hand back.
+            const startHWPending = !!(vvAiStore && vvAiStore.meta && Number(vvAiStore.meta.vvStartHWLast) === 4);
             if (!learningEnabled && !manualScheduleEnabled && !aiControlEnabled && !vvLastManualSchedule) {
+                if (vvHwPeriodOwned() || startHWPending) {
+                    await vvHwRelease('VV-styrning avstängd');
+                }
                 return;
             }
 
@@ -1393,6 +1470,12 @@ async function vvAiTick() {
                 bt6 = undefined;
             }
             if (!bt6 || bt6.data === undefined || !Number.isFinite(Number(bt6.data))) {
+                // Control is skipped while BT6 is unreadable; after a few ticks
+                // hand hot water back to the pump instead of leaving it blocked.
+                vvSensorFailCount++;
+                if (vvSensorFailCount >= VV_SENSOR_FAIL_LIMIT) {
+                    await vvHwRelease('BT6 kan inte läsas');
+                }
                 vvLastBt6 = null;
                 vvInEvent = false;
                 vvEventPeak = null;
@@ -1589,6 +1672,11 @@ async function vvAiTick() {
             const bt7Now = (bt7 && bt7.data !== undefined && Number.isFinite(Number(bt7.data)))
                 ? Number(bt7.data)
                 : NaN;
+            if (Number.isFinite(bt7Now)) {
+                vvSensorFailCount = 0;
+            } else {
+                vvSensorFailCount++;
+            }
 
             let hourIndex = 0;
             let minutesOfDay = 0;
@@ -1730,6 +1818,7 @@ async function vvAiTick() {
                 //   2) efter 5s: hw_period = baseline (20/25 eller sparat värde)
                 // Baseline hålls kvar tills fönstret stänger, då går vi tillbaka till hw_period=0.
                 let periodJustWritten = false;
+                let hwReleased = false;
                 if (hwPeriodKey) {
                     let currentPeriod = NaN;
                     try {
@@ -1741,6 +1830,17 @@ async function vvAiTick() {
                         currentPeriod = NaN;
                     }
 
+                    // Ownership is unknown on the first run with the flag: before
+                    // it, every tick with learning, schedule or AI on forced 0, so
+                    // a 0 with a known backup is ours to restore.
+                    if (Number.isFinite(currentPeriod)) {
+                        const hwNow = (nibe.getConfig() || {}).hotwater || {};
+                        if (hwNow.vv_hw_period_owned === undefined) {
+                            const backup = Number(hwNow.vv_backup_hw_period);
+                            vvSetHwPeriodOwned(currentPeriod === 0 && Number.isFinite(backup) && backup > 0);
+                        }
+                    }
+
                     // Om vi ser ett rimligt baseline-värde (>0) och saknar backup: spara det i config.hotwater.
                     // Detta ger oss ett "original" att falla tillbaka på efter reboot/strömavbrott.
                     if (Number.isFinite(currentPeriod) && currentPeriod > 0) {
@@ -1748,7 +1848,10 @@ async function vvAiTick() {
                             const c = nibe.getConfig() || {};
                             c.hotwater = c.hotwater || {};
                             const prev = Number(c.hotwater.vv_backup_hw_period);
-                            if (!Number.isFinite(prev) || prev <= 0) {
+                            // Also follow the user's own changes while NibePi does
+                            // not hold hw_period, so a restore brings back their
+                            // current value and not the first one ever seen.
+                            if (!Number.isFinite(prev) || prev <= 0 || (!vvHwPeriodOwned() && prev !== currentPeriod)) {
                                 c.hotwater.vv_backup_hw_period = currentPeriod;
                                 nibe.setConfig(c);
                             }
@@ -1834,8 +1937,20 @@ async function vvAiTick() {
                         currentPeriod = desiredPeriod;
                     }
 
-                    if (currentPeriod !== desiredPeriod) {
+                    // Only AI control, the schedule and the min-temp floor drive
+                    // hw_period. Learning alone used to force 0 here as well, which
+                    // left the pump without hot water. When none of them is active,
+                    // or BT7 has been unreadable for several ticks, hand hot water
+                    // back to the pump if NibePi changed it.
+                    const hwControlActive = (aiOk || scheduleActive || minTempEnabled) && vvSensorFailCount < VV_SENSOR_FAIL_LIMIT;
+                    if (!hwControlActive) {
+                        if (vvHwPeriodOwned() || Number(store.meta.vvStartHWLast) === 4) {
+                            await vvHwRelease(vvSensorFailCount >= VV_SENSOR_FAIL_LIMIT ? 'BT7 kan inte läsas' : 'VV-styrning avstängd');
+                        }
+                        hwReleased = true;
+                    } else if (currentPeriod !== desiredPeriod) {
                         nibe.setData(hwPeriodKey, desiredPeriod);
+                        vvSetHwPeriodOwned(true);
                         periodJustWritten = true; // undvik att skriva startHW samma tick om vi precis skrivit period
                     }
                     vvLastManualSchedule = scheduleActive;
@@ -1845,7 +1960,7 @@ async function vvAiTick() {
 // --- Styr VV via startHW=4/0 (Tillfällig lyx) + BT7-target ---
                 // Vi triggar startHW=4 när vi vill värma (min-temp / plan), och sätter startHW=0 när BT7 >= target.
                 // Ingen hysteresis: target är alltid det vi räknar fram (min-temp eller stopptemp).
-                if (startHWKey && (aiOk || scheduleOk || minTempEnabled) && !periodJustWritten) {                    // För startHW är det bättre att bara trigga vid förändring (inte spam-skriva).
+                if (startHWKey && (aiOk || scheduleOk || minTempEnabled) && !periodJustWritten && !hwReleased) {                    // För startHW är det bättre att bara trigga vid förändring (inte spam-skriva).
                     // Vi håller därför senaste skickade värde i RAM (store.meta) och skriver bara vid byte.
                     if (!store.meta) store.meta = {};
                     let lastSentStartHW = Number.isFinite(Number(store.meta.vvStartHWLast)) ? Number(store.meta.vvStartHWLast) : 0;
