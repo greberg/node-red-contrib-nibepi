@@ -3199,15 +3199,15 @@ if(config.price===undefined) {
 
                 }
                 if(hw_adjust!==undefined) {
-                    nibe.reqData(hP.hw_mode).then(result => {
-                        if(result.raw_data!==hw_adjust) nibe.setData(hP.hw_mode,hw_adjust);
-                    }).catch(logCatch)
+                    priceSetHwMode(hw_adjust);
                 }
             } else {
                 sendError('Elprisreglering',`Kunde ej hämta prisnivå från värmepumpen eller funktion avstängd.`);
 
 
             }
+            // Hot water price control switched off: hand hw_mode back.
+            if(hw_enable!==true && priceOwned.hwMode!==null) await priceReleaseHwMode();
             // Justera värme
             if(heat_level!==undefined && heat_level!==0) {
                 let temp_diff = config.price['temp_low_'+system];
@@ -3245,6 +3245,8 @@ if(config.price===undefined) {
                         }
                     }
                 }
+                // Frequency limiting switched off: turn off bands NibePi set.
+                if(config.price.enable_freq!==true && priceOwned.lockBands) await priceReleaseLockBands();
                 if(config.price.enable_freq===true) {
                     await lockFreq({heat:heat_adjust}).then(result => {
                         if(result!==null) nibe.log(`Frekvensen sänkt till ${result} hz`,'price','debug');
@@ -3271,6 +3273,7 @@ if(config.price===undefined) {
                     priceOffset[system] = 0;
                     curveAdjust('price',system,0);
                 }
+                await priceDataMissing(system, 'saknar prisnivå');
 
             }
         } else {
@@ -3357,6 +3360,8 @@ if (typeof level === "string" && /^-?\d+(\.\d+)?$/.test(level)) level = Number(l
                         }
                     }
                 }
+                // Frequency limiting switched off: turn off bands NibePi set.
+                if(config.price.enable_freq!==true && priceOwned.lockBands) await priceReleaseLockBands();
                 if(config.price.enable_freq===true) {
                     await lockFreq({heat:heat_adjust}).then(result => {
                         if(result!==null) nibe.log(`Frekvensen sänkt till ${result} hz`,'price','debug');
@@ -3378,12 +3383,13 @@ if (typeof level === "string" && /^-?\d+(\.\d+)?$/.test(level)) level = Number(l
                 priceOffset[system] = heat_adjust;
                 curveAdjust('price',system,heat_adjust);
                 if(hw_adjust!==undefined) {
-                    nibe.reqData(hP.hw_mode).then(result => {
-                        if(result.raw_data!==hw_adjust) nibe.setData(hP.hw_mode,hw_adjust);
-                    }).catch(logCatch)
+                    priceSetHwMode(hw_adjust);
                 }
+                // Hot water price control switched off: hand hw_mode back.
+                if(hw_enable!==true && priceOwned.hwMode!==null) await priceReleaseHwMode();
             } else {
                 sendError('Elprisreglering',`Kunde ej hämta prisnivå från värmepumpen.`);
+                await priceDataMissing(system, 'saknar prisnivå');
                 if(priceOffset[system]!==0) {
                     priceOffset[system] = 0;
                     await lockFreq({heat:0}).then(result => {
@@ -3775,6 +3781,336 @@ function optimizeElectricityTrading(priceData, options = {}) {
 // # SLUT: Algoritm                                                 #
 // ##################################################################
 
+// Today's and tomorrow's Tibber prices as an hourly list, or null.
+async function fetchTibberPrices(config) {
+    const tibberToken = config.price.token;
+    const tibberOptions = {
+        hostname: 'api.tibber.com',
+        port: 443,
+        path: '/v1-beta/gql',
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${tibberToken}`, 'Content-Type': 'application/json' }
+    };
+
+    const tibberRequest = JSON.stringify({
+        query: "{\
+            viewer {\
+                homes {\
+                id\
+                appNickname\
+                currentSubscription {\
+                    priceInfo(resolution: QUARTER_HOURLY) {\
+                    today{\
+                        startsAt\
+                        total\
+                    }\
+                    tomorrow {\
+                        startsAt\
+                        total\
+                    }\
+                    }\
+                }\
+                }\
+            }\
+            }"
+    });
+
+    const priceResult = await getCloudData(tibberOptions, tibberRequest);
+    if (!priceResult || !priceResult.data || !priceResult.data.viewer) {
+        nibe.log(`Tibber API returnerade ett fel eller ingen data. Svar: ${JSON.stringify(priceResult)}`, 'price', 'error');
+        sendError('Lokal AI', 'Kunde inte hämta prisdata från Tibber. Kontrollera token och abonnemang.');
+        return null;
+    }
+
+    // An empty homes list means the token belongs to an account that
+    // does not hold the electricity contract.
+    const homes = priceResult.data.viewer.homes || [];
+    // tibber_home may be an index (0, 1, ...), a home id or the
+    // home's nickname in the Tibber app. Index 0 when unset.
+    const wanted = config.price.tibber_home;
+    let home;
+    if (wanted === undefined || wanted === '' || wanted === null) {
+        home = homes[0];
+    } else if (/^\d+$/.test(String(wanted))) {
+        home = homes[Number(wanted)];
+    } else {
+        home = homes.find(h => h.id === wanted || (h.appNickname || '').toLowerCase() === String(wanted).toLowerCase());
+    }
+    if (!home || !home.currentSubscription || !home.currentSubscription.priceInfo) {
+        const available = homes.map((h, i) => `${i}: ${h.appNickname || '(inget namn)'} [${h.id}]${h.currentSubscription ? '' : ' utan aktivt abonnemang'}`).join(', ');
+        nibe.log(`Tibber: inget hem/abonnemang hittades för token (tibber_home=${wanted === undefined ? '0' : wanted}, antal hem: ${homes.length}${available ? ', tillgängliga: ' + available : ''})`, 'price', 'error');
+        sendError('Lokal AI', 'Tibber-token saknar hem eller aktivt abonnemang.');
+        return null;
+    }
+    const priceInfo = home.currentSubscription.priceInfo;
+
+    const quarterlyPriceList = (priceInfo.today || []).concat(priceInfo.tomorrow || []);
+    if (quarterlyPriceList.length === 0) {
+        nibe.log('Ingen prisdata alls tillgänglig.', 'price', 'warn');
+        return null;
+    }
+    
+    // ##################################################################
+    // # START: Logik för att konvertera kvartspriser till timpriser    #
+    // ##################################################################
+    const hourlyPriceList = [];
+    // Gruppera hela objekt (inte bara priset) för att komma åt tidsstämpeln senare
+    const groupedByHour = quarterlyPriceList.reduce((acc, price) => {
+        const hour = price.startsAt.substring(0, 13); // "2025-09-30T10"
+        if (!acc[hour]) {
+            acc[hour] = [];
+        }
+        acc[hour].push(price); 
+        return acc;
+    }, {});
+
+
+
+    for (const hour in groupedByHour) {
+        const itemsInHour = groupedByHour[hour];
+        // Beräkna snittet
+        const averagePrice = itemsInHour.reduce((sum, p) => sum + p.total, 0) / itemsInHour.length;
+        
+        // Dynamisk tidszon: Hämta slutet på datumsträngen från första kvarten i timmen
+        // Exempel in: "2025-11-25T10:00:00.000+01:00" -> Vi tar ".000+01:00"
+        const timeZoneSuffix = itemsInHour[0].startsAt.slice(19);
+
+        hourlyPriceList.push({
+            startsAt: `${hour}:00:00${timeZoneSuffix}`,
+            total: averagePrice
+        });
+    }
+    nibe.log(`Hämtade ${quarterlyPriceList.length} kvartspunkter och konverterade till ${hourlyPriceList.length} stabila timpunkter.`, 'price', 'debug');
+    return hourlyPriceList;
+}
+// Today's and tomorrow's prices from elprisetjustnu.se as an hourly list, or null.
+async function fetchElprisPrices(config) {
+    const area = config.price.area || 'SE3';
+
+    // Steg 1: Hämta data från elprisetjustnu.se för idag och imorgon
+    const today = new Date();
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+
+    // Local date parts: toISOString() is UTC, which between 00 and
+    // 02 local time gave yesterday's month/day with today's year.
+    const monthDay = (d) => String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+    const todayYear = today.getFullYear();
+    const todayMonthDay = monthDay(today); // Ger "10-07"
+    const tomorrowYear = tomorrow.getFullYear();
+    const tomorrowMonthDay = monthDay(tomorrow);
+
+    const optionsToday = {
+        hostname: 'www.elprisetjustnu.se',
+        port: 443,
+        path: `/api/v1/prices/${todayYear}/${todayMonthDay}_${area}.json`,
+        method: 'GET'
+    };
+    const optionsTomorrow = {
+        hostname: 'www.elprisetjustnu.se',
+        port: 443,
+        path: `/api/v1/prices/${tomorrowYear}/${tomorrowMonthDay}_${area}.json`,
+        method: 'GET'
+    };
+
+    const [todayResult, tomorrowResult] = await Promise.all([
+        getCloudData(optionsToday, "{}").catch(e => {
+            nibe.log(`Kunde inte hämta priser för idag från elprisetjustnu.se`, 'price', 'warn');
+            return [];
+        }),
+        getCloudData(optionsTomorrow, "{}").catch(e => {
+            nibe.log(`Kunde inte hämta priser för imorgon (detta är normalt före kl 14).`, 'price', 'debug');
+            return [];
+        })
+    ]);
+
+    const rawPriceList = [].concat(todayResult || [], tomorrowResult || []);
+
+    if (rawPriceList.length === 0) {
+        nibe.log('Ingen prisdata kunde hämtas från elprisetjustnu.se.', 'price', 'error');
+        return null;
+    }
+
+    // Steg 2: Medelvärdesbilda kvartspriser till timpriser
+    const hourlyPriceList = [];
+    // Gruppera hela objekt (inte bara priset) för att komma åt tidsstämpeln senare
+    const groupedByHour = rawPriceList.reduce((acc, price) => {
+        const hour = price.time_start.substring(0, 13);
+        if (!acc[hour]) {
+            acc[hour] = [];
+        }
+        acc[hour].push(price); // Spara hela objektet
+        return acc;
+    }, {});
+
+
+
+    for (const hour in groupedByHour) {
+        const itemsInHour = groupedByHour[hour];
+        // Beräkna snittet
+        const averagePrice = itemsInHour.reduce((sum, p) => sum + p.SEK_per_kWh, 0) / itemsInHour.length;
+        
+        // Dynamisk tidszon: Hämta tidszonssuffixet från det första objektet i timmen
+        // Exempel in: "2025-11-25T10:00:00+01:00" -> Vi tar "+01:00"
+        const timeZoneSuffix = itemsInHour[0].time_start.slice(19);
+
+        hourlyPriceList.push({
+            startsAt: `${hour}:00:00${timeZoneSuffix}`,
+            total: averagePrice
+        });
+    }
+    nibe.log(`Hämtade ${rawPriceList.length} kvartspunkter och konverterade till ${hourlyPriceList.length} stabila timpunkter.`, 'price', 'debug');
+    return hourlyPriceList;
+}
+// Last fetched hourly price list. Prices were fetched on every updateData
+// run (every 3 min and per system), and a short API outage left price
+// control without data. Now refreshed at most every 15 min and at each new
+// hour; when a fetch fails or lacks the current hour, the cached list is
+// used for as long as it covers the current hour.
+const PRICE_REFRESH_MS = 15 * 60000;
+let priceListCache = null; // {key, list, fetchedAt, hour}
+const priceListCovers = (list, hourTs) => Array.isArray(list) &&
+    list.some(p => p && p.startsAt && new Date(p.startsAt).getTime() === hourTs);
+async function getPriceList(key, fetcher) {
+    const now = Date.now();
+    const hourStart = new Date(now);
+    hourStart.setMinutes(0, 0, 0);
+    const hourTs = hourStart.getTime();
+    const cached = (priceListCache !== null && priceListCache.key === key) ? priceListCache : null;
+    if (cached !== null && cached.hour === hourTs && now - cached.fetchedAt < PRICE_REFRESH_MS) {
+        return cached.list;
+    }
+    let list = null;
+    try {
+        list = await fetcher();
+    } catch (err) {
+        nibe.log(`Kunde inte hämta elpriser: ${err && err.message ? err.message : err}`, 'price', 'warn');
+        list = null;
+    }
+    if (priceListCovers(list, hourTs)) {
+        priceListCache = { key, list, fetchedAt: now, hour: hourTs };
+        return list;
+    }
+    if (cached !== null && priceListCovers(cached.list, hourTs)) {
+        nibe.log('Använder senast hämtade elpriser', 'price', 'debug');
+        return cached.list;
+    }
+    return null;
+}
+
+// Price fail-safe. What price control last wrote is remembered, so the
+// fail-safe only undoes NibePi's own changes and never fights the user: a
+// register is only restored while it still holds the value NibePi wrote.
+const PRICE_GRACE_MS = 30 * 60000;
+const priceStartTs = Date.now();
+const priceOwned = { hwMode: null, hwModeBefore: null, prioAdd: null, prioAddBefore: null, lockBands: false };
+const priceLastOk = {};
+const priceWasEnabled = {};
+const priceFailsafeLogged = {};
+function priceOk(system) {
+    priceLastOk[system] = Date.now();
+    priceFailsafeLogged[system] = false;
+}
+// No usable price level: neutral settings once it has lasted the grace period.
+async function priceDataMissing(system, why) {
+    const last = (priceLastOk[system] !== undefined) ? priceLastOk[system] : priceStartTs;
+    if (Date.now() - last < PRICE_GRACE_MS) return;
+    await priceFailsafe(system, why);
+}
+// Offset 0, lock-frequency bands off, hw_mode and prioritised additive back.
+async function priceFailsafe(system, why) {
+    if (priceFailsafeLogged[system] !== true) {
+        priceFailsafeLogged[system] = true;
+        nibe.log(`Elprisreglering ${why} (${system}), återgår till neutrala inställningar`, 'price', 'info');
+    }
+    if (priceOffset[system] !== undefined && priceOffset[system] !== 0) {
+        priceOffset[system] = 0;
+        curveAdjust('price', system, 0);
+    }
+    if (hP === undefined) return;
+    await priceReleaseLockBands();
+    await priceReleaseHwMode();
+    await priceReleasePrioAdd();
+}
+async function priceReleaseLockBands() {
+    if (!priceOwned.lockBands || hP === undefined) return;
+    for (const key of ['lock_freq_1_activate', 'lock_freq_2_activate']) {
+        if (hP[key] === undefined) continue;
+        const current = await getNibeData(hP[key]).catch(() => undefined);
+        if (current !== undefined && Number(current.data) === 0) continue;
+        const err = await setDataAsync(hP[key], 0);
+        if (err) {
+            nibe.log(`Kunde inte stänga av spärrband (${key}): ${err}`, 'price', 'error');
+            return;
+        }
+    }
+    priceOwned.lockBands = false;
+    nibe.log('Spärrband för frekvens avaktiverade', 'price', 'debug');
+}
+// The user's normal hot water mode: the mode configured for NORMAL price
+// level, else whatever the pump had before NibePi changed it.
+function priceHwModeNormal() {
+    const config = nibe.getConfig() || {};
+    const normal = Number(config.price ? config.price.hotwater_normal : undefined);
+    if (Number.isInteger(normal) && normal >= 0 && normal <= 2) return normal;
+    return priceOwned.hwModeBefore;
+}
+async function priceReleaseHwMode() {
+    if (priceOwned.hwMode === null || hP === undefined || hP.hw_mode === undefined) return;
+    const current = await getNibeData(hP.hw_mode).catch(() => undefined);
+    if (current === undefined) return;
+    const normal = priceHwModeNormal();
+    if (Number(current.raw_data) === priceOwned.hwMode && normal !== null && normal !== priceOwned.hwMode) {
+        const err = await setDataAsync(hP.hw_mode, normal);
+        if (err) {
+            nibe.log(`Kunde inte återställa varmvattenläge: ${err}`, 'price', 'error');
+            return;
+        }
+        nibe.log(`Varmvattenläge återställt till ${normal}`, 'price', 'debug');
+    }
+    priceOwned.hwMode = null;
+    priceOwned.hwModeBefore = null;
+}
+async function priceReleasePrioAdd() {
+    if (priceOwned.prioAdd === null || hP === undefined || hP['prio_add_enable'] === undefined) return;
+    const current = await getNibeData(hP['prio_add_enable']).catch(() => undefined);
+    if (current === undefined) return;
+    const before = priceOwned.prioAddBefore;
+    if (Number(current.raw_data) === priceOwned.prioAdd && before !== null && before !== priceOwned.prioAdd) {
+        const err = await setDataAsync(hP['prio_add_enable'], before);
+        if (err) {
+            nibe.log(`Kunde inte återställa prioriterad tillsats: ${err}`, 'price', 'error');
+            return;
+        }
+        nibe.log(`Prioriterad tillsats återställd till ${before}`, 'price', 'debug');
+    }
+    priceOwned.prioAdd = null;
+    priceOwned.prioAddBefore = null;
+}
+// hw_mode from price control: an integer 0..2 only. A missing config value
+// gave NaN, and `NaN !== raw_data` wrote it on every run.
+function priceSetHwMode(value) {
+    if (!Number.isInteger(value) || value < 0 || value > 2) {
+        nibe.log(`Ogiltigt varmvattenläge från elprisregleringen (${value}), skriver inte`, 'price', 'debug');
+        return;
+    }
+    nibe.reqData(hP.hw_mode).then(result => {
+        const current = Number(result.raw_data);
+        if (current === value) return;
+        // A value NibePi did not write is the user's: remember it.
+        if (priceOwned.hwMode === null || priceOwned.hwMode !== current) priceOwned.hwModeBefore = current;
+        nibe.setData(hP.hw_mode, value, (err) => {
+            if (!err) priceOwned.hwMode = value;
+        });
+    }).catch(logCatch);
+}
+function priceSetPrioAdd(current, value) {
+    current = Number(current);
+    if (priceOwned.prioAdd === null || priceOwned.prioAdd !== current) priceOwned.prioAddBefore = current;
+    nibe.setData(hP['prio_add_enable'], value, (err) => {
+        if (!err) priceOwned.prioAdd = value;
+    });
+}
 // runPrice, nu med 15-min stöd och dynamisk hantering av sommar-/vintertid
 async function runPrice(data,array) {
 
@@ -3799,6 +4135,11 @@ async function runPrice(data,array) {
         }
     }
     data.priceSensor = inside;
+    // Switching price control off used to leave its last state on the pump.
+    if(!priceEnabled && priceWasEnabled[data.system]===true) {
+        await priceFailsafe(data.system, 'avstängd');
+    }
+    priceWasEnabled[data.system] = priceEnabled;
     if(priceEnabled) {
         nibe.log(`Elprisreglering är aktiverad`,'price','debug');
         if(config.price.source=="tibber") {
@@ -3806,109 +4147,16 @@ async function runPrice(data,array) {
 
             if(config.price.token === undefined || config.price.token === "") {
                 sendError('Lokal AI',`Tibber Token krävs för att hämta prisdata.`);
+                await priceDataMissing(data.system, 'Tibber-token saknas');
                 return;
             }
 
             try {
-                const tibberToken = config.price.token;
-                const tibberOptions = {
-                    hostname: 'api.tibber.com',
-                    port: 443,
-                    path: '/v1-beta/gql',
-                    method: 'POST',
-                    headers: { 'Authorization': `Bearer ${tibberToken}`, 'Content-Type': 'application/json' }
-                };
-
-                const tibberRequest = JSON.stringify({
-                    query: "{\
-                        viewer {\
-                            homes {\
-                            id\
-                            appNickname\
-                            currentSubscription {\
-                                priceInfo(resolution: QUARTER_HOURLY) {\
-                                today{\
-                                    startsAt\
-                                    total\
-                                }\
-                                tomorrow {\
-                                    startsAt\
-                                    total\
-                                }\
-                                }\
-                            }\
-                            }\
-                        }\
-                        }"
-                });
-
-                const priceResult = await getCloudData(tibberOptions, tibberRequest);
-                if (!priceResult || !priceResult.data || !priceResult.data.viewer) {
-                    nibe.log(`Tibber API returnerade ett fel eller ingen data. Svar: ${JSON.stringify(priceResult)}`, 'price', 'error');
-                    sendError('Lokal AI', 'Kunde inte hämta prisdata från Tibber. Kontrollera token och abonnemang.');
+                const fullPriceList = await getPriceList(`tibber|${config.price.token}|${config.price.tibber_home}`, () => fetchTibberPrices(config));
+                if (fullPriceList === null) {
+                    await priceDataMissing(data.system, 'prisdata från Tibber saknas');
                     return;
                 }
-
-                // An empty homes list means the token belongs to an account that
-                // does not hold the electricity contract.
-                const homes = priceResult.data.viewer.homes || [];
-                // tibber_home may be an index (0, 1, ...), a home id or the
-                // home's nickname in the Tibber app. Index 0 when unset.
-                const wanted = config.price.tibber_home;
-                let home;
-                if (wanted === undefined || wanted === '' || wanted === null) {
-                    home = homes[0];
-                } else if (/^\d+$/.test(String(wanted))) {
-                    home = homes[Number(wanted)];
-                } else {
-                    home = homes.find(h => h.id === wanted || (h.appNickname || '').toLowerCase() === String(wanted).toLowerCase());
-                }
-                if (!home || !home.currentSubscription || !home.currentSubscription.priceInfo) {
-                    const available = homes.map((h, i) => `${i}: ${h.appNickname || '(inget namn)'} [${h.id}]${h.currentSubscription ? '' : ' utan aktivt abonnemang'}`).join(', ');
-                    nibe.log(`Tibber: inget hem/abonnemang hittades för token (tibber_home=${wanted === undefined ? '0' : wanted}, antal hem: ${homes.length}${available ? ', tillgängliga: ' + available : ''})`, 'price', 'error');
-                    sendError('Lokal AI', 'Tibber-token saknar hem eller aktivt abonnemang.');
-                    return;
-                }
-                const priceInfo = home.currentSubscription.priceInfo;
-
-                const quarterlyPriceList = (priceInfo.today || []).concat(priceInfo.tomorrow || []);
-                if (quarterlyPriceList.length === 0) {
-                    nibe.log('Ingen prisdata alls tillgänglig.', 'price', 'warn');
-                    return;
-                }
-                
-                // ##################################################################
-                // # START: Logik för att konvertera kvartspriser till timpriser    #
-                // ##################################################################
-                const hourlyPriceList = [];
-                // Gruppera hela objekt (inte bara priset) för att komma åt tidsstämpeln senare
-                const groupedByHour = quarterlyPriceList.reduce((acc, price) => {
-                    const hour = price.startsAt.substring(0, 13); // "2025-09-30T10"
-                    if (!acc[hour]) {
-                        acc[hour] = [];
-                    }
-                    acc[hour].push(price); 
-                    return acc;
-                }, {});
-
-
-
-                for (const hour in groupedByHour) {
-                    const itemsInHour = groupedByHour[hour];
-                    // Beräkna snittet
-                    const averagePrice = itemsInHour.reduce((sum, p) => sum + p.total, 0) / itemsInHour.length;
-                    
-                    // Dynamisk tidszon: Hämta slutet på datumsträngen från första kvarten i timmen
-                    // Exempel in: "2025-11-25T10:00:00.000+01:00" -> Vi tar ".000+01:00"
-                    const timeZoneSuffix = itemsInHour[0].startsAt.slice(19);
-
-                    hourlyPriceList.push({
-                        startsAt: `${hour}:00:00${timeZoneSuffix}`,
-                        total: averagePrice
-                    });
-                }
-                nibe.log(`Hämtade ${quarterlyPriceList.length} kvartspunkter och konverterade till ${hourlyPriceList.length} stabila timpunkter.`, 'price', 'debug');
-                const fullPriceList = hourlyPriceList;
                 // VV-AI: cacha timpriser i RAM för VV-analys (ingen SD-skrivning)
                 vvAiPriceCache = fullPriceList;
                 // ##################################################################
@@ -3924,6 +4172,7 @@ async function runPrice(data,array) {
                 const futurePriceList = fullPriceList.filter(p => p && p.startsAt && (new Date(p.startsAt) >= now));
                 if (futurePriceList.length === 0) {
                     nibe.log('Ingen framtida prisdata tillgänglig.', 'price', 'warn');
+                    await priceDataMissing(data.system, 'prisdata för aktuell timme saknas');
                     return;
                 }
                 const currentHour = futurePriceList[0];
@@ -4031,6 +4280,7 @@ try {
 
                 data.heat_price_level = { data: heat.level, raw_data: heat.level };
                 data.hw_price_level = { data: hw.level, raw_data: hw.level };
+                priceOk(data.system);
                 
                 nibe.log(`Lokal analys klar. Nivå: ${heat.level}, Pris: ${data.price_current.data} öre`, 'price', 'debug');
                 
@@ -4055,19 +4305,21 @@ try {
                         if((price + fee) > (cost * 100 * cop)) {
                             if(prio_add_enable.raw_data===0) {
                                 nibe.log(`Värmepumpen är dyrare att köra än prioriterad tillsats. Slår på tillsats.`, 'price', 'debug');
-                                nibe.setData(hP['prio_add_enable'],1);
+                                priceSetPrioAdd(prio_add_enable.raw_data,1);
                             }
                         } else {
                             if(prio_add_enable.raw_data===1) {
                                 nibe.log(`Värmepumpen är billigare att köra än prioriterad tillsats. Slår av tillsats.`, 'price', 'debug');
-                                nibe.setData(hP['prio_add_enable'],0);
+                                priceSetPrioAdd(prio_add_enable.raw_data,0);
                             }
                         }
+                    } else if(priceOwned.prioAdd!==null) {
+                        await priceReleasePrioAdd();
                     }
                 }
 
                 if (true) {
-                    priceAdjustCurve(data);
+                    await priceAdjustCurve(data).catch(err => nibe.log(`Fel i elprisjusteringen: ${err}`, 'price', 'error'));
                     adjustPool(data,data.system)
                     .then(pool => {
                         if(pool!==undefined){ nibe.log('POOL-EMIT sys='+data.system,'price','debug'); nibeData.emit('pluginPriceGraphPool',priceBuildPoolGraph(heat,data.system)); }
@@ -4081,13 +4333,19 @@ try {
             } catch(err) {
                 nibe.log(`Fel i Lokal AI-styrning: ${err}`, 'price', 'error');
                 console.log(err);
+                await priceDataMissing(data.system, 'fel i prisanalysen');
             }
 
         } else if(config.price.source=="nibe") {
             nibe.log(`Källan är Nibe`,'price','debug');
             data.price_level = await getNibeData(hP['price_level']).catch(logCatch);
             data.price_enable = await getNibeData(hP['price_enable']).catch(logCatch);
-            priceAdjustCurve(data)
+            if(data.price_level===undefined || data.price_level===null) {
+                await priceDataMissing(data.system, 'prisnivå från värmepumpen saknas');
+                return;
+            }
+            if(data.price_level.data!==undefined && data.price_level.data!==0) priceOk(data.system);
+            await priceAdjustCurve(data).catch(err => nibe.log(`Fel i elprisjusteringen: ${err}`, 'price', 'error'));
             data.price_current = await getNibeData(hP['price_current']).catch(logCatch);
             nibeData.emit('pluginPriceGraph',nibeBuildGraph(data,data.system));
             nibeData.emit('pluginPrice',data);
@@ -4095,83 +4353,11 @@ try {
             nibe.log(`Källan är Lokal AI (via elprisetjustnu.se)`,'price','debug');
 
             try {
-                const area = config.price.area || 'SE3';
-
-                // Steg 1: Hämta data från elprisetjustnu.se för idag och imorgon
-                const today = new Date();
-                const tomorrow = new Date(today);
-                tomorrow.setDate(tomorrow.getDate() + 1);
-
-                // Local date parts: toISOString() is UTC, which between 00 and
-                // 02 local time gave yesterday's month/day with today's year.
-                const monthDay = (d) => String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
-                const todayYear = today.getFullYear();
-                const todayMonthDay = monthDay(today); // Ger "10-07"
-                const tomorrowYear = tomorrow.getFullYear();
-                const tomorrowMonthDay = monthDay(tomorrow);
-
-                const optionsToday = {
-                    hostname: 'www.elprisetjustnu.se',
-                    port: 443,
-                    path: `/api/v1/prices/${todayYear}/${todayMonthDay}_${area}.json`,
-                    method: 'GET'
-                };
-                const optionsTomorrow = {
-                    hostname: 'www.elprisetjustnu.se',
-                    port: 443,
-                    path: `/api/v1/prices/${tomorrowYear}/${tomorrowMonthDay}_${area}.json`,
-                    method: 'GET'
-                };
-
-                const [todayResult, tomorrowResult] = await Promise.all([
-                    getCloudData(optionsToday, "{}").catch(e => {
-                        nibe.log(`Kunde inte hämta priser för idag från elprisetjustnu.se`, 'price', 'warn');
-                        return [];
-                    }),
-                    getCloudData(optionsTomorrow, "{}").catch(e => {
-                        nibe.log(`Kunde inte hämta priser för imorgon (detta är normalt före kl 14).`, 'price', 'debug');
-                        return [];
-                    })
-                ]);
-
-                const rawPriceList = [].concat(todayResult || [], tomorrowResult || []);
-
-                if (rawPriceList.length === 0) {
-                    nibe.log('Ingen prisdata kunde hämtas från elprisetjustnu.se.', 'price', 'error');
+                const fullPriceList = await getPriceList(`elpris|${config.price.area || 'SE3'}`, () => fetchElprisPrices(config));
+                if (fullPriceList === null) {
+                    await priceDataMissing(data.system, 'prisdata från elprisetjustnu.se saknas');
                     return;
                 }
-
-                // Steg 2: Medelvärdesbilda kvartspriser till timpriser
-                const hourlyPriceList = [];
-                // Gruppera hela objekt (inte bara priset) för att komma åt tidsstämpeln senare
-                const groupedByHour = rawPriceList.reduce((acc, price) => {
-                    const hour = price.time_start.substring(0, 13);
-                    if (!acc[hour]) {
-                        acc[hour] = [];
-                    }
-                    acc[hour].push(price); // Spara hela objektet
-                    return acc;
-                }, {});
-
-
-
-                for (const hour in groupedByHour) {
-                    const itemsInHour = groupedByHour[hour];
-                    // Beräkna snittet
-                    const averagePrice = itemsInHour.reduce((sum, p) => sum + p.SEK_per_kWh, 0) / itemsInHour.length;
-                    
-                    // Dynamisk tidszon: Hämta tidszonssuffixet från det första objektet i timmen
-                    // Exempel in: "2025-11-25T10:00:00+01:00" -> Vi tar "+01:00"
-                    const timeZoneSuffix = itemsInHour[0].time_start.slice(19);
-
-                    hourlyPriceList.push({
-                        startsAt: `${hour}:00:00${timeZoneSuffix}`,
-                        total: averagePrice
-                    });
-                }
-                nibe.log(`Hämtade ${rawPriceList.length} kvartspunkter och konverterade till ${hourlyPriceList.length} stabila timpunkter.`, 'price', 'debug');
-                const fullPriceList = hourlyPriceList;
-
                 // VV-AI: cacha timpriser i RAM för VV-analys (ingen SD-skrivning)
                 vvAiPriceCache = fullPriceList;
 
@@ -4180,6 +4366,7 @@ try {
                 const futurePriceList = fullPriceList.filter(p => p && p.startsAt && (new Date(p.startsAt) >= now));
                 if (futurePriceList.length === 0) {
                     nibe.log('Ingen framtida prisdata tillgänglig.', 'price', 'warn');
+                    await priceDataMissing(data.system, 'prisdata för aktuell timme saknas');
                     return;
                 }
                 const currentHour = futurePriceList[0];
@@ -4287,6 +4474,7 @@ try {
 
                 data.heat_price_level = { data: heat.level, raw_data: heat.level };
                 data.hw_price_level = { data: hw.level, raw_data: hw.level };
+                priceOk(data.system);
 
                 nibe.log(`Lokal analys klar. Nivå: ${heat.level}, Pris: ${data.price_current.data} öre`, 'price', 'debug');
 
@@ -4309,19 +4497,21 @@ try {
                         if((price + fee) > (cost * 100 * cop)) {
                             if(prio_add_enable.raw_data===0) {
                                 nibe.log(`Värmepumpen är dyrare att köra än prioriterad tillsats. Slår på tillsats.`, 'price', 'debug');
-                                nibe.setData(hP['prio_add_enable'],1);
+                                priceSetPrioAdd(prio_add_enable.raw_data,1);
                             }
                         } else {
                             if(prio_add_enable.raw_data===1) {
                                 nibe.log(`Värmepumpen är billigare att köra än prioriterad tillsats. Slår av tillsats.`, 'price', 'debug');
-                                nibe.setData(hP['prio_add_enable'],0);
+                                priceSetPrioAdd(prio_add_enable.raw_data,0);
                             }
                         }
+                    } else if(priceOwned.prioAdd!==null) {
+                        await priceReleasePrioAdd();
                     }
                 }
 
                 if (true) {
-                    priceAdjustCurve(data);
+                    await priceAdjustCurve(data).catch(err => nibe.log(`Fel i elprisjusteringen: ${err}`, 'price', 'error'));
                     adjustPool(data,data.system)
                     .then(pool => {
                         if(pool!==undefined){ nibe.log('POOL-EMIT sys='+data.system,'price','debug'); nibeData.emit('pluginPriceGraphPool',priceBuildPoolGraph(heat,data.system)); }
@@ -4335,6 +4525,7 @@ try {
             } catch (err) {
                 nibe.log(`Fel vid hämtning/analys från elprisetjustnu.se: ${err}`, 'price', 'error');
                 console.log(err);
+                await priceDataMissing(data.system, 'fel i prisanalysen');
             }
         }
     }
@@ -4625,6 +4816,7 @@ const lockFreq = (options) => {
                                 if(err) {
 
                                 } else {
+                                    priceOwned.lockBands = true;
                                     nibe.setData(hP['lock_freq_1_activate'],"1")
                                 }
 
@@ -4642,6 +4834,7 @@ const lockFreq = (options) => {
             if(lock_freq_2_max.data!==120) nibe.setData(hP['lock_freq_2_max'],"120");
             if(options.heat < 0) {
                 // Aktivera spärrband
+                if(lock_freq_1.data!==1 || lock_freq_2.data!==1) priceOwned.lockBands = true;
                 if(lock_freq_1.data!==1) nibe.setData(hP['lock_freq_1_activate'],"1");
                 if(lock_freq_2.data!==1) nibe.setData(hP['lock_freq_2_activate'],"1");
                 if(config.price.block_add===true) {
@@ -4671,6 +4864,7 @@ const lockFreq = (options) => {
                 // Avaktivera spärrband
                 if(lock_freq_1.data!==0) nibe.setData(hP['lock_freq_1_activate'],"0");
                 if(lock_freq_2.data!==0) nibe.setData(hP['lock_freq_2_activate'],"0");
+                priceOwned.lockBands = false;
                 resolve(null)
             }
         }).catch(err => {
