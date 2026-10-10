@@ -1,5 +1,5 @@
 
-const { subscriber } = require('./node_util');
+const { subscriber, serialized, coreConnected } = require('./node_util');
 module.exports = function(RED) {
     function nibeRMU(config) {
         RED.nodes.createNode(this,config);
@@ -9,6 +9,7 @@ module.exports = function(RED) {
         // config node's emit() (see node_util.js).
         const sub = subscriber(this, server);
         
+        let announced = false;
         const startUp = () => {
             let system = config.system.replace('s','S');
             this.status({ fill: 'yellow', shape: 'dot', text: `RMU 40 ${system}` });
@@ -19,6 +20,7 @@ module.exports = function(RED) {
                 conf.rmu = {};
                 server.nibe.setConfig(conf);
             }
+            if(conf.home===undefined) conf.home = {};
             if(conf.home.inside_sensors===undefined) {
                 conf.home.inside_sensors = [];
                 server.nibe.setConfig(conf);
@@ -33,15 +35,23 @@ module.exports = function(RED) {
                     arr.push(insideSensor);
                 }
             }
-        server.initiatePlugin(arr,'rmu',config.system).then(data => {
+        return server.initiatePlugin(arr,'rmu',config.system).then(data => {
             this.status({ fill: 'green', shape: 'dot', text: `RMU 40 ${system}` });
-            server.sendError('RMU 40',`RMU 40 ${system} ${server.text.sys_connected}`);
+            // startUp re-runs on every 'ready'/'rmu_ready'; only announce the
+            // connection when it is new.
+            if(announced===false) {
+                announced = true;
+                server.sendError('RMU 40',`RMU 40 ${system} ${server.text.sys_connected}`);
+            }
             this.send({enabled:true});
         },(reject => {
+            announced = false;
             this.status({ fill: 'red', shape: 'dot', text: `RMU 40 ${system}` });
             this.send({enabled:false});
         }));
         }
+        // One startUp at a time; errors and rejections go to node.error.
+        const start = serialized(this, startUp);
         this.send({enabled:false});
         this.on('input', function(msg) {
             let conf = server.nibe.getConfig();
@@ -56,31 +66,22 @@ module.exports = function(RED) {
                     conf[req[0]][req[1]+'_'+config.system] = msg.payload;
                     server.nibe.setConfig(conf);
                 }
-                startUp();
+                start();
             }
             
         });
 
-        if(server.checkRMU()===true) {
-            startUp();
-        } else {
-            server.nibeData.once('rmu_ready', (data) => {
-                startUp();
-            })
-        }
-        if(server.nibe.core!==undefined && server.nibe.core.connected!==undefined && server.nibe.core.connected===true) {
-            startUp();
-        } else {
-            sub('ready', (data) => {
-                startUp();
-            })
-        }
+        // Both through sub() so they are released on close (a bare once()
+        // leaked across redeploys), and through start() so the two arriving
+        // together run startUp once - it used to run twice and toast
+        // "RMU connected" twice.
+        sub('rmu_ready', () => start());
+        sub('ready', () => start());
+        if(server.checkRMU()===true || coreConnected(server)) start();
         sub(this.id, (data) => {
             if(data.changed===true) {
                 config.system = data.system;
-                if(server.nibe.core!==undefined && server.nibe.core.connected!==undefined && server.nibe.core.connected===true) {
-                    startUp();
-                }
+                if(coreConnected(server)) start();
             }
         })
         sub('pluginRMU', (data) => {

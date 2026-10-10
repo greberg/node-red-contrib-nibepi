@@ -1,5 +1,5 @@
 
-const { subscriber } = require('./node_util');
+const { subscriber, serialized, coreConnected } = require('./node_util');
 module.exports = function(RED) {
     function nibeFan(config) {
         RED.nodes.createNode(this,config);
@@ -38,7 +38,7 @@ module.exports = function(RED) {
                     arr.push(co2Sensor);
                 }
             }*/
-        server.initiatePlugin(arr,'fan',config.system).then(data => {
+        return server.initiatePlugin(arr,'fan',config.system).then(data => {
             this.status({ fill: 'green', shape: 'dot', text: `System ${system}` });
             this.send({enabled:true});
         },(reject => {
@@ -46,6 +46,8 @@ module.exports = function(RED) {
             this.send({enabled:false});
         }));
         }
+        // One startUp at a time; errors and rejections go to node.error.
+        const start = serialized(this, startUp);
         this.on('input', function(msg) {
             let conf = server.nibe.getConfig();
             if(msg.topic=="update") {
@@ -59,23 +61,19 @@ module.exports = function(RED) {
                     conf[req[0]][req[1]] = msg.payload;
                     server.nibe.setConfig(conf);
                 }
-                startUp();
+                start();
             }
             
         });
-        if(server.nibe.core!==undefined && server.nibe.core.connected!==undefined && server.nibe.core.connected===true) {
-            startUp();
-        } else {
-            sub('ready', (data) => {
-                startUp();
-            })
-        }
+        // Restart on every 'ready' (reconnect, sensor list change), not only when
+        // the node was created before the pump connected: after a partial
+        // redeploy the plugin would otherwise never restart on a reconnect.
+        sub('ready', () => start());
+        if(coreConnected(server)) start();
         sub(this.id, (data) => {
             if(data.changed===true) {
                 config.system = data.system;
-                if(server.nibe.core!==undefined && server.nibe.core.connected!==undefined && server.nibe.core.connected===true) {
-                    startUp();
-                }
+                if(coreConnected(server)) start();
             }
         })
         sub('pluginFan', (data) => {

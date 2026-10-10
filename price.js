@@ -1,4 +1,4 @@
-const { subscriber } = require('./node_util');
+const { subscriber, serialized, coreConnected } = require('./node_util');
 module.exports = function(RED) {
     function nibePrice(config) {
         RED.nodes.createNode(this,config);
@@ -15,7 +15,8 @@ module.exports = function(RED) {
                 {topic:"inside_set_"+config.system,source:"nibe"},
                 {topic:"outside",source:"nibe"}
             ];
-            if(conf.system.pump!=="F370" && conf.system.pump!=="F470") {
+            const pump = conf.system!==undefined ? conf.system.pump : undefined;
+            if(pump!=="F370" && pump!=="F470") {
                 arr.push({topic:"dM",source:"nibe"});
                 arr.push({topic:"dMstart",source:"nibe"})
             }
@@ -24,6 +25,7 @@ module.exports = function(RED) {
                 conf.price = {};
                 server.nibe.setConfig(conf);
             }
+            if(conf.home===undefined) conf.home = {};
             if(conf.home.inside_sensors===undefined) {
                 conf.home.inside_sensors = [];
                 server.nibe.setConfig(conf);
@@ -39,7 +41,7 @@ module.exports = function(RED) {
                 }
             }
             if(conf.price.enable!==true) arr = [];
-                server.initiatePlugin(arr,'price',config.system).then(data => {
+                return server.initiatePlugin(arr,'price',config.system).then(data => {
                     this.status({ fill: 'green', shape: 'dot', text: `System ${system}` });
                     this.send({enabled:true});
                 },(reject => {
@@ -48,6 +50,8 @@ module.exports = function(RED) {
                 }));
         
         }
+        // One startUp at a time; errors and rejections go to node.error.
+        const start = serialized(this, startUp);
         this.on('input', function(msg) {
             let conf = server.nibe.getConfig();
             if(msg.topic=="update") {
@@ -61,7 +65,7 @@ module.exports = function(RED) {
                     conf[req[0]][req[1]] = msg.payload;
                     server.nibe.setConfig(conf);
                 }
-                startUp();
+                start();
             } else if(msg.payload!==undefined && msg.topic!==undefined && msg.topic!=="") {
                 let req = msg.topic.split('/');
                 if(conf[req[0]]===undefined) conf[req[0]] = {};
@@ -69,23 +73,19 @@ module.exports = function(RED) {
                     conf[req[0]][req[1]+'_'+config.system] = msg.payload;
                     server.nibe.setConfig(conf);
                 }
-                startUp();
+                start();
             }
             
         });
-        if(server.nibe.core!==undefined && server.nibe.core.connected!==undefined && server.nibe.core.connected===true) {
-            startUp();
-        } else {
-            sub('ready', (data) => {
-                startUp();
-            })
-        }
+        // Restart on every 'ready' (reconnect, sensor list change), not only when
+        // the node was created before the pump connected: after a partial
+        // redeploy the plugin would otherwise never restart on a reconnect.
+        sub('ready', () => start());
+        if(coreConnected(server)) start();
         sub(this.id, (data) => {
             if(data.changed===true) {
                 config.system = data.system;
-                if(server.nibe.core!==undefined && server.nibe.core.connected!==undefined && server.nibe.core.connected===true) {
-                    startUp();
-                }
+                if(coreConnected(server)) start();
             }
         })
         sub('pluginPriceGraph', (data) => {

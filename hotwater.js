@@ -1,5 +1,5 @@
 
-const { subscriber } = require('./node_util');
+const { subscriber, serialized, coreConnected } = require('./node_util');
 module.exports = function(RED) {
      function nibeHotwater(config) {
         RED.nodes.createNode(this,config);
@@ -18,7 +18,7 @@ module.exports = function(RED) {
                 conf.price = {};
                 server.nibe.setConfig(conf);
             }
-            server.initiatePlugin(arr,'hotwater').then(result => {
+            return server.initiatePlugin(arr,'hotwater').then(result => {
             this.status({ fill: 'green', shape: 'dot', text: `` });
             this.send({enabled:true});
         },(reject => {
@@ -26,14 +26,14 @@ module.exports = function(RED) {
             this.send({enabled:false});
         }));
         }
+        // One startUp at a time; errors and rejections go to node.error.
+        const start = serialized(this, startUp);
         
-        if(server.nibe.core!==undefined && server.nibe.core.connected!==undefined && server.nibe.core.connected===true) {
-            startUp();
-        } else {
-            sub('ready', (data) => {
-                startUp();
-            })
-        }
+        // Restart on every 'ready' (reconnect, sensor list change), not only when
+        // the node was created before the pump connected: after a partial
+        // redeploy the plugin would otherwise never restart on a reconnect.
+        sub('ready', () => start());
+        if(coreConnected(server)) start();
         this.on('input', function(msg) {
             let conf = server.nibe.getConfig();
             if(msg.topic=="update") {
@@ -45,16 +45,14 @@ module.exports = function(RED) {
                 if(conf[req[0]][req[1]+'_'+config.system]!==msg.payload) {
                     conf[req[0]][req[1]+'_'+config.system] = msg.payload;
                     server.nibe.setConfig(conf);
-                    startUp();
+                    start();
                 }
             }
             
         });
         sub(this.id, (data) => {
             if(data.changed===true) {
-                if(server.nibe.core!==undefined && server.nibe.core.connected!==undefined && server.nibe.core.connected===true) {
-                    startUp();
-                }
+                if(coreConnected(server)) start();
             }
         })
         sub('pluginHotwaterAutoLuxury', (value) => {
