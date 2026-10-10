@@ -3602,7 +3602,16 @@ async function runPrice(data,array) {
                     return;
                 }
 
-                const priceInfo = priceResult.data.viewer.homes[config.price.tibber_home || 0].currentSubscription.priceInfo;
+                // An empty homes list means the token belongs to an account that
+                // does not hold the electricity contract.
+                const homes = priceResult.data.viewer.homes || [];
+                const home = homes[config.price.tibber_home || 0];
+                if (!home || !home.currentSubscription || !home.currentSubscription.priceInfo) {
+                    nibe.log(`Tibber: inget hem/abonnemang hittades för token (antal hem: ${homes.length})`, 'price', 'error');
+                    sendError('Lokal AI', 'Tibber-token saknar hem eller aktivt abonnemang.');
+                    return;
+                }
+                const priceInfo = home.currentSubscription.priceInfo;
 
                 const quarterlyPriceList = (priceInfo.today || []).concat(priceInfo.tomorrow || []);
                 if (quarterlyPriceList.length === 0) {
