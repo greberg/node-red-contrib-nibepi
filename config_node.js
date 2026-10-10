@@ -60,6 +60,23 @@ module.exports = function(RED) {
     };
     const nibeData = new EventEmitter()
     const nibe = require('nibepi')
+    // Replacement for .catch(logCatch) on pump requests. Resolves to
+    // undefined like before, but: stays quiet while the pump has not announced
+    // its model yet (every request fails then and startup reruns on the next
+    // 'ready'), logs one line instead of a stack trace, and repeats the same
+    // message at most once a minute - a noisy RS485 bus otherwise produces
+    // hundreds of identical "No respond" lines.
+    const logCatchSeen = new Map();
+    const logCatch = (err) => {
+        const msg = err && err.message ? err.message : String(err);
+        if (msg === 'Heatpump is not ready yet.') return;
+        const now = Date.now();
+        const seen = logCatchSeen.get(msg);
+        if (seen && now - seen.at < 60000) { seen.skipped++; return; }
+        const skipped = seen && seen.skipped ? ` (upprepat ${seen.skipped} gånger senaste minuten)` : '';
+        logCatchSeen.set(msg, { at: now, skipped: 0 });
+        RED.log.warn(`[nibepi] ${msg}${skipped}`);
+    };
     var serialPort = "";
     var tcp_host = "";
     var tcp_port = "";
@@ -2119,7 +2136,7 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                                         });
                                     }
                                 }
-                            }).catch(console.log)
+                            }).catch(logCatch)
 
                         }, 5000,i);
                     }
@@ -2441,7 +2458,7 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
                                 data.topic = item.registers[i].topic;
                                 result[item.registers[i].topic] = data;
                                 array.push(data)
-                            }).catch(console.log)
+                            }).catch(logCatch)
                     }
                 }
             }
@@ -2566,7 +2583,7 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
             nibe.log(`Aktuell utomhustemperatur: ${outside}`,'weather','debug');
             if(val['heatcurve_'+val.system]===undefined) {
                 console.log('Hämtar värmekurva manuellt.')
-                val['heatcurve_'+val.system] = await getNibeData(hP['heatcurve_'+val.system]).catch(console.log)
+                val['heatcurve_'+val.system] = await getNibeData(hP['heatcurve_'+val.system]).catch(logCatch)
             }
             if(val['heatcurve_'+val.system]===undefined) {
                 nibe.log(`Kunde inte läsa värmekurvan, hoppar över prognosreglering.`,'weather','error');
@@ -2956,7 +2973,7 @@ if(config.price===undefined) {
                 if(hw_adjust!==undefined) {
                     nibe.reqData(hP.hw_mode).then(result => {
                         if(result.raw_data!==hw_adjust) nibe.setData(hP.hw_mode,hw_adjust);
-                    }).catch(console.log)
+                    }).catch(logCatch)
                 }
             } else {
                 sendError('Elprisreglering',`Kunde ej hämta prisnivå från värmepumpen eller funktion avstängd.`);
@@ -3060,7 +3077,7 @@ if (typeof level === "string" && /^-?\d+(\.\d+)?$/.test(level)) level = Number(l
                         if(config.system.pump!=="F370" && config.system.pump!=="F470") {
                             if(heat_adjust!==0) {
                                 if(data.dM===undefined) {
-                                    data.dM = await getNibeData(hP['dM']).catch(console.log)
+                                    data.dM = await getNibeData(hP['dM']).catch(logCatch)
                                 }
                                 if(data.dM.data > 0 && data.dM.data > data.dMstart.data+25) {
                                     nibe.log(`Ställer in gradminuter nära start ${data.dMstart.data+25}`,'price','debug');
@@ -3078,7 +3095,7 @@ if (typeof level === "string" && /^-?\d+(\.\d+)?$/.test(level)) level = Number(l
                         if(config.system.pump!=="F370" && config.system.pump!=="F470") {
                             if(heat_adjust!==0) {
                                 if(data.dM===undefined) {
-                                    data.dM = await getNibeData(hP['dM']).catch(console.log);
+                                    data.dM = await getNibeData(hP['dM']).catch(logCatch);
                                 }
                                 if(data.dM.data > 0 && data.dM.data > data.dMstart.data+25) {
                                     nibe.log(`Ställer in gradminuter nära start ${data.dMstart.data+25}`,'price','debug');
@@ -3135,7 +3152,7 @@ if (typeof level === "string" && /^-?\d+(\.\d+)?$/.test(level)) level = Number(l
                 if(hw_adjust!==undefined) {
                     nibe.reqData(hP.hw_mode).then(result => {
                         if(result.raw_data!==hw_adjust) nibe.setData(hP.hw_mode,hw_adjust);
-                    }).catch(console.log)
+                    }).catch(logCatch)
                 }
             } else {
                 sendError('Elprisreglering',`Kunde ej hämta prisnivå från värmepumpen.`);
@@ -3814,7 +3831,7 @@ try {
                     .then(pool => {
                         if(pool!==undefined){ nibe.log('POOL-EMIT sys='+data.system,'price','debug'); nibeData.emit('pluginPriceGraphPool',priceBuildPoolGraph(heat,data.system)); }
                     })
-                    .catch(console.log);
+                    .catch(logCatch);
                 }
 
                 nibeData.emit('pluginPrice',data);
@@ -3827,10 +3844,10 @@ try {
 
         } else if(config.price.source=="nibe") {
             nibe.log(`Källan är Nibe`,'price','debug');
-            data.price_level = await getNibeData(hP['price_level']).catch(console.log);
-            data.price_enable = await getNibeData(hP['price_enable']).catch(console.log);
+            data.price_level = await getNibeData(hP['price_level']).catch(logCatch);
+            data.price_enable = await getNibeData(hP['price_enable']).catch(logCatch);
             priceAdjustCurve(data)
-            data.price_current = await getNibeData(hP['price_current']).catch(console.log);
+            data.price_current = await getNibeData(hP['price_current']).catch(logCatch);
             nibeData.emit('pluginPriceGraph',nibeBuildGraph(data,data.system));
             nibeData.emit('pluginPrice',data);
         } else if(config.price.source=="priceai" || config.price.source=="local_ai") {
@@ -4065,7 +4082,7 @@ try {
                     .then(pool => {
                         if(pool!==undefined){ nibe.log('POOL-EMIT sys='+data.system,'price','debug'); nibeData.emit('pluginPriceGraphPool',priceBuildPoolGraph(heat,data.system)); }
                     })
-                    .catch(console.log);
+                    .catch(logCatch);
                 }
 
                 nibeData.emit('pluginPrice',data);
@@ -4119,10 +4136,10 @@ try {
 				}
 
                 if(config.price.pool_enable_s1===true) {
-                    const poolTemp = getNibeData(hP['pool_temp_'+system]).catch(console.log)
-                    const poolStart = getNibeData(hP['pool_start_temp_'+system]).catch(console.log)
-                    const poolStop = getNibeData(hP['pool_stop_temp_'+system]).catch(console.log)
-                    const poolCpr = getNibeData(hP['pool_cpr_'+system]).catch(console.log)
+                    const poolTemp = getNibeData(hP['pool_temp_'+system]).catch(logCatch)
+                    const poolStart = getNibeData(hP['pool_start_temp_'+system]).catch(logCatch)
+                    const poolStop = getNibeData(hP['pool_stop_temp_'+system]).catch(logCatch)
+                    const poolCpr = getNibeData(hP['pool_cpr_'+system]).catch(logCatch)
                     if(config.price.pool_max_temp===undefined || isNaN(config.price.pool_max_temp)) config.price.pool_max_temp = 100
                     Promise.all([poolTemp, poolStart, poolStop, poolCpr]).then((values) => {
 
@@ -4214,10 +4231,10 @@ if (!level || (typeof level === 'string' && !['VERY_CHEAP','CHEAP','NORMAL','EXP
                 })
         } else if(req.name=="hw") {
                 try {
-                    const bt6 = getNibeData(hP['bt6']).catch(console.log);
-                    const bt7 = getNibeData(hP['bt7']).catch(console.log);
-                    const hwStartTemp = getNibeData(hP['hw_start_0']).catch(console.log);
-                    const hwStopTemp = getNibeData(hP['hw_stop_2']).catch(console.log);
+                    const bt6 = getNibeData(hP['bt6']).catch(logCatch);
+                    const bt7 = getNibeData(hP['bt7']).catch(logCatch);
+                    const hwStartTemp = getNibeData(hP['hw_start_0']).catch(logCatch);
+                    const hwStopTemp = getNibeData(hP['hw_stop_2']).catch(logCatch);
                     Promise.all([bt6, bt7, hwStartTemp, hwStopTemp]).then((values) => {
 
 
@@ -4313,13 +4330,13 @@ const lockFreq = (options) => {
         var max_temp = config.price.max_temp
         var min_freq = config.price.min_freq
         var max_freq = config.price.max_freq
-        var outside = getNibeData(hP['outside']).catch(console.log);
-        var lock_freq_1 = getNibeData(hP['lock_freq_1_activate']).catch(console.log);
-        var lock_freq_2 = getNibeData(hP['lock_freq_2_activate']).catch(console.log);
-        var lock_freq_1_min = getNibeData(hP['lock_freq_1_min']).catch(console.log);
-        var lock_freq_1_max = getNibeData(hP['lock_freq_1_max']).catch(console.log);
-        var lock_freq_2_min = getNibeData(hP['lock_freq_2_min']).catch(console.log);
-        var lock_freq_2_max = getNibeData(hP['lock_freq_2_max']).catch(console.log);
+        var outside = getNibeData(hP['outside']).catch(logCatch);
+        var lock_freq_1 = getNibeData(hP['lock_freq_1_activate']).catch(logCatch);
+        var lock_freq_2 = getNibeData(hP['lock_freq_2_activate']).catch(logCatch);
+        var lock_freq_1_min = getNibeData(hP['lock_freq_1_min']).catch(logCatch);
+        var lock_freq_1_max = getNibeData(hP['lock_freq_1_max']).catch(logCatch);
+        var lock_freq_2_min = getNibeData(hP['lock_freq_2_min']).catch(logCatch);
+        var lock_freq_2_max = getNibeData(hP['lock_freq_2_max']).catch(logCatch);
         Promise.all([lock_freq_1, lock_freq_2, lock_freq_1_min, lock_freq_1_max, lock_freq_2_min, lock_freq_2_max,outside]).then(async (values) => {
             lock_freq_1 = values[0]
             lock_freq_2 = values[1]
@@ -4369,16 +4386,16 @@ const lockFreq = (options) => {
                 if(lock_freq_1.data!==1) nibe.setData(hP['lock_freq_1_activate'],"1");
                 if(lock_freq_2.data!==1) nibe.setData(hP['lock_freq_2_activate'],"1");
                 if(config.price.block_add===true) {
-                    var dM = await getNibeData(hP['dM']).catch(console.log)
-                    var dMaddstart = await getNibeData(hP['dMaddstart']).catch(console.log)
+                    var dM = await getNibeData(hP['dM']).catch(logCatch)
+                    var dMaddstart = await getNibeData(hP['dMaddstart']).catch(logCatch)
                     if(dMaddstart!==undefined) {
                         if(dM.data < (dMaddstart.data+50)) {
                             nibe.setData(hP['dM'],(dMaddstart.data+100));
                             nibe.log(`Förhindrar gradminuter från att starta tillsats`,'price','debug');
                         }
                     } else {
-                        var dMadd = await getNibeData(hP['dMadd']).catch(console.log);
-                        var dMstart = await getNibeData(hP['dMstart']).catch(console.log);
+                        var dMadd = await getNibeData(hP['dMadd']).catch(logCatch);
+                        var dMstart = await getNibeData(hP['dMstart']).catch(logCatch);
                         if(dMadd===undefined || dMstart===undefined) {
                             nibe.log(`Kunde inte läsa gradminutregister, hoppar över frekvensspärr.`,'price','error');
                             return resolve(null);
@@ -4422,8 +4439,8 @@ const blockAdditive = (options) => {
     // implicit global `data` left behind by an unrelated HTTP handler, and
     // dMstart was never fetched at all, so the function threw before doing
     // anything useful. Callers reported that as "pump does not support this".
-    const dM = await getNibeData(hP['dM']).catch(console.log);
-    const dMstart = await getNibeData(hP['dMstart']).catch(console.log);
+    const dM = await getNibeData(hP['dM']).catch(logCatch);
+    const dMstart = await getNibeData(hP['dMstart']).catch(logCatch);
     if(dM===undefined || dMstart===undefined) {
         nibe.log(`Kunde inte läsa gradminutregister, hoppar över blockering av tillsats.`,'price','error');
         return reject(new Error('Kunde inte läsa gradminutregister'));
@@ -4433,7 +4450,7 @@ const blockAdditive = (options) => {
     // is what the original fallback path did.
     let dMaddstart = await getNibeData(hP['dMaddstart']).catch(() => undefined);
     if(dMaddstart===undefined || dMaddstart.data===undefined) {
-        const dMadd = await getNibeData(hP['dMadd']).catch(console.log);
+        const dMadd = await getNibeData(hP['dMadd']).catch(logCatch);
         if(dMadd===undefined) {
             nibe.log(`Kunde inte läsa gradminutregister, hoppar över blockering av tillsats.`,'price','error');
             return reject(new Error('Kunde inte läsa gradminutregister'));
@@ -4473,15 +4490,15 @@ const blockAdditive = (options) => {
         let hwStopTemp;
         let data = {};
         if(config.hotwater.enable_autoluxury===true || config.hotwater.enable_hw_priority===true) {
-            hwON = await getNibeData(hP['startHW']).catch(console.log);
-            bt6 = await getNibeData(hP['bt6']).catch(console.log);
-            bt7 = await getNibeData(hP['bt7']).catch(console.log);
-            hwMode = await getNibeData(hP['hw_mode']).catch(console.log);
+            hwON = await getNibeData(hP['startHW']).catch(logCatch);
+            bt6 = await getNibeData(hP['bt6']).catch(logCatch);
+            bt7 = await getNibeData(hP['bt7']).catch(logCatch);
+            hwMode = await getNibeData(hP['hw_mode']).catch(logCatch);
             if(hwMode===undefined) {
                 nibe.log(`Kunde inte läsa varmvattenläge, hoppar över varmvattenreglering.`,'hw','error');
                 return;
             }
-            hwStopTemp = await getNibeData(hP['hw_stop_'+hwMode.raw_data]).catch(console.log);
+            hwStopTemp = await getNibeData(hP['hw_stop_'+hwMode.raw_data]).catch(logCatch);
             data.bt6 = bt6;
             data.bt7 = bt7;
             data.hwMode = hwMode;
@@ -4554,7 +4571,7 @@ const blockAdditive = (options) => {
             nibeData.emit('pluginHotwaterAutoLuxury',data);
         }
         if(config.hotwater.enable_hw_priority===true) {
-            hwStartTemp = await getNibeData(hP['hw_start_'+hwMode.data]).catch(console.log);
+            hwStartTemp = await getNibeData(hP['hw_start_'+hwMode.data]).catch(logCatch);
             if(hwStartTemp===undefined) {
                 nibe.log(`Kunde inte läsa starttemperatur för varmvatten, hoppar över.`,'hw','error');
                 return;
@@ -4615,12 +4632,12 @@ async function runFan() {
         nibe.log('Kör runFan()', 'fan', 'debug');
 
         // Steg 1: Hämta grundläggande data (återgår till steg-för-steg-metoden)
-        data.cpr_set = await getNibeData(hP['cpr_set']).catch(console.log);
-        data.temp_fan_speed = await getNibeData(hP['fan_mode']).catch(console.log);
-        data.fan_speed = await getNibeData(hP['fan_speed']).catch(console.log);
-        data.bs1_flow = await getNibeData(hP['bs1_flow']).catch(console.log);
-        data.alarm = await getNibeData(hP['alarm']).catch(console.log);
-        data.evaporator = await getNibeData(hP['evaporator']).catch(console.log);
+        data.cpr_set = await getNibeData(hP['cpr_set']).catch(logCatch);
+        data.temp_fan_speed = await getNibeData(hP['fan_mode']).catch(logCatch);
+        data.fan_speed = await getNibeData(hP['fan_speed']).catch(logCatch);
+        data.bs1_flow = await getNibeData(hP['bs1_flow']).catch(logCatch);
+        data.alarm = await getNibeData(hP['alarm']).catch(logCatch);
+        data.evaporator = await getNibeData(hP['evaporator']).catch(logCatch);
 
         if ([data.cpr_set, data.temp_fan_speed, data.fan_speed, data.bs1_flow, data.alarm, data.evaporator].some(val => val === undefined)) {
             nibe.log('Väntar på all startdata från värmepumpen...', 'fan', 'debug');
@@ -4641,9 +4658,9 @@ async function runFan() {
         }
 
         if (config.fan.enable_dm_boost === true && config.system.pump !== "F370" && config.system.pump !== "F470") {
-            data.dM = await getNibeData(hP['dM']).catch(console.log);
-            data.dMstart = await getNibeData(hP['dMstart']).catch(console.log);
-            data.dMaddstart = await getNibeData(hP['dMaddstart']).catch(console.log);
+            data.dM = await getNibeData(hP['dM']).catch(logCatch);
+            data.dMstart = await getNibeData(hP['dMstart']).catch(logCatch);
+            data.dMaddstart = await getNibeData(hP['dMaddstart']).catch(logCatch);
 
             if(data.dM && data.dMstart && data.dMaddstart) {
                 let boost_threshold = data.dMaddstart.data + (config.fan.dm_boost_start || 300);
@@ -4700,7 +4717,7 @@ async function runFan() {
         }
 
         // Steg 4: Spara och rapportera data
-        data.cpr_act = await getNibeData(hP['cpr_act']).catch(console.log);
+        data.cpr_act = await getNibeData(hP['cpr_act']).catch(logCatch);
         saveDataGraph('fan_setpoint',timeNow,flow_set,true);
         if(fan_filter_low_eff!==undefined && fan_filter_normal_eff===undefined) {
             filter_eff = Number((fan_filter_low_eff).toFixed(0));
@@ -4728,12 +4745,12 @@ async function runFanOrginal() {
         const promise = new Promise(async function (resolve,reject) {
         let config = nibe.getConfig();
         if(config.fan.enable_dm_boost!==undefined && config.fan.enable_dm_boost===true && config.system.pump!=="F370" && config.system.pump!=="F470") {
-        data.dMadd = await getNibeData(hP['dMadd']).catch(console.log);
-        data.dMaddstart = await getNibeData(hP['dMaddstart']).catch(console.log)
-        data.dMstart = await getNibeData(hP['dMstart']).catch(console.log);
+        data.dMadd = await getNibeData(hP['dMadd']).catch(logCatch);
+        data.dMaddstart = await getNibeData(hP['dMaddstart']).catch(logCatch)
+        data.dMstart = await getNibeData(hP['dMstart']).catch(logCatch);
         if(data.dMaddstart===undefined) {
             data.dMaddstart = {}
-            data.dMadd = await getNibeData(hP['dMadd']).catch(console.log);
+            data.dMadd = await getNibeData(hP['dMadd']).catch(logCatch);
             if(data.dMstart===undefined || data.dMadd===undefined) {
                 nibe.log(`Kunde inte läsa gradminutregister, hoppar över boostkontroll.`,'fan','error');
                 return reject(new Error('Kunde inte läsa gradminutregister'));
@@ -4741,7 +4758,7 @@ async function runFanOrginal() {
             data.dMaddstart.data = data.dMstart.data-data.dMadd.data
             data.dMaddstart.raw_data = data.dMstart.raw_data-data.dMadd.raw_data
         }
-        data.dM = await getNibeData(hP['dM']).catch(console.log);
+        data.dM = await getNibeData(hP['dM']).catch(logCatch);
             nibe.log(`Luftflödes boost vid låga gradminuter aktiverat.`,'fan','debug');
             if(config.fan.dm_boost_start===undefined || config.fan.dm_boost_start=="" || config.fan.dm_boost_start===0) {
                 config.fan.dm_boost_start = 300;
@@ -4753,8 +4770,8 @@ async function runFanOrginal() {
         if(boost>(data.dMstart.data-100)) {
             reject(new Error(`Startvärde för boost ligger för nära gradminuter vid start av kompressor, ${boost}>${data.dMstart.data-100}`))
         } else {
-            var lock_freq_1 = await getNibeData(hP['lock_freq_1_activate']).catch(console.log);
-            var lock_freq_2 = await getNibeData(hP['lock_freq_2_activate']).catch(console.log);
+            var lock_freq_1 = await getNibeData(hP['lock_freq_1_activate']).catch(logCatch);
+            var lock_freq_2 = await getNibeData(hP['lock_freq_2_activate']).catch(logCatch);
 
             if(lock_freq_1===undefined || lock_freq_2===undefined) {
                 nibe.log(`Kunde inte läsa spärrbandsregister, hoppar över boostkontroll.`,'fan','error');
@@ -4831,19 +4848,19 @@ async function runFanOrginal() {
         // Function turned off, stopping.
         return;
     }
-    data.temp_fan_speed = await getNibeData(hP['fan_mode']).catch(console.log);
+    data.temp_fan_speed = await getNibeData(hP['fan_mode']).catch(logCatch);
     if(data.temp_fan_speed===undefined) {
         nibe.log('Ingen data från fläktforceringsregister. Avbryter...','fan','error');
         return;
     }
 
     data.co2Sensor;
-    data.fan_speed = await getNibeData(hP['fan_speed']).catch(console.log);
-    data.bs1_flow = await getNibeData(hP['bs1_flow']).catch(console.log);
+    data.fan_speed = await getNibeData(hP['fan_speed']).catch(logCatch);
+    data.bs1_flow = await getNibeData(hP['bs1_flow']).catch(logCatch);
     // Check if bug with saving 0% resolves if(flow_set===undefined) flow_set = data.bs1_flow.raw_data;
-    data.alarm = await getNibeData(hP['alarm']).catch(console.log);
-    data.evaporator = await getNibeData(hP['evaporator']).catch(console.log);
-    data.cpr_set = await getNibeData(hP['cpr_set']).catch(console.log);
+    data.alarm = await getNibeData(hP['alarm']).catch(logCatch);
+    data.evaporator = await getNibeData(hP['evaporator']).catch(logCatch);
+    data.cpr_set = await getNibeData(hP['cpr_set']).catch(logCatch);
 
     if(config.fan.enable_co2===true) {
     if(config.fan.sensor===undefined || config.fan.sensor=="Ingen") {
@@ -5135,7 +5152,7 @@ async function runFanOrginal() {
         if(data.evaporator.raw_data<0) nibe.log(`Villkor för reglering ej uppfyllt, förångaren för kall (${data.evaporator.raw_data})`,'fan','debug');
         if(data.temp_fan_speed!==undefined && data.temp_fan_speed.raw_data!==0) nibe.log(`Villkor för reglering ej uppfyllt, Tillfällig fläktforcering pågår. värde: ${data.temp_fan_speed.raw_data}`,'fan','debug');
     }
-    data.cpr_act = await getNibeData(hP['cpr_act']).catch(console.log);
+    data.cpr_act = await getNibeData(hP['cpr_act']).catch(logCatch);
     saveDataGraph('fan_setpoint',timeNow,flow_set,true);
     saveDataGraph('filter_eff',timeNow,filter_eff,true);
     data.filter_eff = filter_eff;
@@ -5298,7 +5315,7 @@ async function runDiagnostic() {
                 }
                 saveDataGraph('cpr_runtime',Date.now(),0,true);
             }
-        }).catch(console.log);
+        }).catch(logCatch);
     }
     async function defrostCheck() {
         if(timer.diagnostic!==undefined && timer.diagnostic._idleTimeout>0) {
@@ -5349,9 +5366,9 @@ async function runDiagnostic() {
 async function tenMinuteUpdate() {
     let config = nibe.getConfig();
     if(config.system.auto_update===undefined || config.system.auto_update===true) {
-        getNibeData(hP['inside_set_s1']).catch(console.log);
+        getNibeData(hP['inside_set_s1']).catch(logCatch);
         if(systems!==undefined && systems.s2===true) {
-            getNibeData(hP['inside_set_s2']).catch(console.log);
+            getNibeData(hP['inside_set_s2']).catch(logCatch);
         }
     }
 }
@@ -5362,16 +5379,16 @@ async function minuteUpdate() {
         nibe.setConfig(config);
     }
     if(config.system.auto_update===true) {
-        getNibeData(hP['outside']).catch(console.log);
-        getNibeData(hP['inside_s1']).catch(console.log);
-        getNibeData(hP['curveadjust_s1']).catch(console.log);
-        getNibeData(hP['setpoint_s1']).catch(console.log);
-        getNibeData(hP['supply_s1']).catch(console.log);
+        getNibeData(hP['outside']).catch(logCatch);
+        getNibeData(hP['inside_s1']).catch(logCatch);
+        getNibeData(hP['curveadjust_s1']).catch(logCatch);
+        getNibeData(hP['setpoint_s1']).catch(logCatch);
+        getNibeData(hP['supply_s1']).catch(logCatch);
         if(systems!==undefined && systems.s2===true) {
-            getNibeData(hP['inside_s2']).catch(console.log);
-            getNibeData(hP['curveadjust_s2']).catch(console.log);
-            getNibeData(hP['setpoint_s2']).catch(console.log);
-            getNibeData(hP['supply_s2']).catch(console.log);
+            getNibeData(hP['inside_s2']).catch(logCatch);
+            getNibeData(hP['curveadjust_s2']).catch(logCatch);
+            getNibeData(hP['setpoint_s2']).catch(logCatch);
+            getNibeData(hP['supply_s2']).catch(logCatch);
         }
     }
 }
@@ -5460,14 +5477,14 @@ const checkTranslation = (node) => {
                                 const tableLoaded = Array.isArray(registerTable) && registerTable.length > 0;
                                 const hasRegister = (addr) => !tableLoaded || registerTable.some(entry => entry.register == addr);
                                 if(hasRegister('40047')) {
-                                    var c1 = await getNibeData('40047').catch(console.log)
+                                    var c1 = await getNibeData('40047').catch(logCatch)
                                     if(c1!==undefined && c1.data > 0) {
                                         hP.supply_s1 = "40047";
                                         console.log('Register 40047 found, using it for supply temp S1')
                                     }
                                 }
                                 if(hasRegister('40071')) {
-                                    var c2 = await getNibeData('40071').catch(console.log)
+                                    var c2 = await getNibeData('40071').catch(logCatch)
                                     if(c2!==undefined && c2.data > 0)  {
                                         hP.supply_s1 = "40071";
                                         console.log('Register 40071 found, using it for supply temp S1')
