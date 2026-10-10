@@ -4102,10 +4102,13 @@ try {
                 const tomorrow = new Date(today);
                 tomorrow.setDate(tomorrow.getDate() + 1);
 
+                // Local date parts: toISOString() is UTC, which between 00 and
+                // 02 local time gave yesterday's month/day with today's year.
+                const monthDay = (d) => String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
                 const todayYear = today.getFullYear();
-                const todayMonthDay = today.toISOString().slice(5, 10); // Ger "10-07"
+                const todayMonthDay = monthDay(today); // Ger "10-07"
                 const tomorrowYear = tomorrow.getFullYear();
-                const tomorrowMonthDay = tomorrow.toISOString().slice(5, 10);
+                const tomorrowMonthDay = monthDay(tomorrow);
 
                 const optionsToday = {
                     hostname: 'www.elprisetjustnu.se',
@@ -4463,7 +4466,12 @@ if (!level || (typeof level === 'string' && !['VERY_CHEAP','CHEAP','NORMAL','EXP
         }
         var ts = new Date()
         var hour = ts.getHours()
-        var req = JSON.parse(request)
+        var req = {};
+        try {
+            req = JSON.parse(request) || {};
+        } catch(err) {
+            req = {};
+        }
         if(req.name=="heat") {
                 get(options,request).then(async (data) => {
                     resolve(data)
@@ -4477,7 +4485,7 @@ if (!level || (typeof level === 'string' && !['VERY_CHEAP','CHEAP','NORMAL','EXP
                     const hwStartTemp = getNibeData(hP['hw_start_0']).catch(logCatch);
                     const hwStopTemp = getNibeData(hP['hw_stop_2']).catch(logCatch);
                     Promise.all([bt6, bt7, hwStartTemp, hwStopTemp]).then((values) => {
-
+                        if(values.some(v => v===undefined)) throw new Error('Kunde inte läsa varmvattenregister');
 
                         request = JSON.parse(request)
                         request.battery = {
@@ -4493,7 +4501,7 @@ if (!level || (typeof level === 'string' && !['VERY_CHEAP','CHEAP','NORMAL','EXP
                         }).catch(async (err) => {
                             reject(err)
                         })
-                    })
+                    }).catch(err => reject(err))
                 } catch(err) {
                     console.log('Was not able to get values for hw optimization from the cloud')
                     get(options,request).then(async (data) => {
@@ -4513,13 +4521,16 @@ if (!level || (typeof level === 'string' && !['VERY_CHEAP','CHEAP','NORMAL','EXP
             const promise = new Promise((resolve,reject) => {
                 let data = "";
                 const req = https.request(options, (res) => {
-
+                res.setEncoding('utf8');
                 res.on('data', (d) => {
                         data += d;
 
                 })
+                res.on('error', (error) => {
+                    reject(error)
+                })
                 res.on('end', () => {
-                    if(res.statusCode===200) {
+                    if(res.statusCode>=200 && res.statusCode<300) {
                         try {
                             data = JSON.parse(data)
 
@@ -4531,16 +4542,23 @@ if (!level || (typeof level === 'string' && !['VERY_CHEAP','CHEAP','NORMAL','EXP
                             nibe.log(`Något blev fel vid JSON konvertering. Servern svarade: ${data}`, 'price', 'error');
 
                             //nibe.log(`Något blev fel vid JSON konvertering`,'price','debug');
-                            reject('No JSON response')
+                            reject(new Error('No JSON response'))
                         }
                     } else {
-                        sendError('Cloud',`Ej kontakt med servern`);
-                        reject(res.statusMessage)
+                        // 404 is the normal answer for tomorrow's prices before
+                        // they are published; not worth a fault every run.
+                        if(res.statusCode!==404) sendError('Cloud',`Ej kontakt med servern`);
+                        reject(new Error(`HTTP ${res.statusCode} ${res.statusMessage || ''}`.trim()))
                     }
 
                 });
                 })
 
+                // Without a timeout a hung connection kept the caller (and the
+                // serialized updateData) waiting forever.
+                req.setTimeout(15000, () => {
+                    req.destroy(new Error('Timeout efter 15 s'));
+                })
                 req.on('error', (error) => {
                 sendError('Cloud',`Ej kontakt med servern`);
                 reject(error)
