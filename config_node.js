@@ -3595,6 +3595,8 @@ async function runPrice(data,array) {
                     query: "{\
                         viewer {\
                             homes {\
+                            id\
+                            appNickname\
                             currentSubscription {\
                                 priceInfo(resolution: QUARTER_HOURLY) {\
                                 today{\
@@ -3622,9 +3624,20 @@ async function runPrice(data,array) {
                 // An empty homes list means the token belongs to an account that
                 // does not hold the electricity contract.
                 const homes = priceResult.data.viewer.homes || [];
-                const home = homes[config.price.tibber_home || 0];
+                // tibber_home may be an index (0, 1, ...), a home id or the
+                // home's nickname in the Tibber app. Index 0 when unset.
+                const wanted = config.price.tibber_home;
+                let home;
+                if (wanted === undefined || wanted === '' || wanted === null) {
+                    home = homes[0];
+                } else if (/^\d+$/.test(String(wanted))) {
+                    home = homes[Number(wanted)];
+                } else {
+                    home = homes.find(h => h.id === wanted || (h.appNickname || '').toLowerCase() === String(wanted).toLowerCase());
+                }
                 if (!home || !home.currentSubscription || !home.currentSubscription.priceInfo) {
-                    nibe.log(`Tibber: inget hem/abonnemang hittades för token (antal hem: ${homes.length})`, 'price', 'error');
+                    const available = homes.map((h, i) => `${i}: ${h.appNickname || '(inget namn)'} [${h.id}]${h.currentSubscription ? '' : ' utan aktivt abonnemang'}`).join(', ');
+                    nibe.log(`Tibber: inget hem/abonnemang hittades för token (tibber_home=${wanted === undefined ? '0' : wanted}, antal hem: ${homes.length}${available ? ', tillgängliga: ' + available : ''})`, 'price', 'error');
                     sendError('Lokal AI', 'Tibber-token saknar hem eller aktivt abonnemang.');
                     return;
                 }
