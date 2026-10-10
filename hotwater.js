@@ -61,6 +61,12 @@ module.exports = function(RED) {
                 if(coreConnected(server)) start();
             }
         })
+        // A core fault means the pump link is down: show it until the next
+        // 'ready' restarts the plugin (startUp sets the status again).
+        sub('fault', (data) => {
+            if(data===undefined || data===null || data.from!=="core") return;
+            this.status({ fill: 'red', shape: 'ring', text: `Core fault` });
+        });
         sub('pluginHotwaterAutoLuxury', (value) => {
             if(value.bt7!==undefined && value.bt7.data>-3276) {
                 const bt6 = value.bt6!==undefined ? value.bt6.data : undefined;

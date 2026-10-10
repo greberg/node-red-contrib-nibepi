@@ -77,6 +77,12 @@ module.exports = function(RED) {
                 if(coreConnected(server)) start();
             }
         })
+        // A core fault means the pump link is down: show it until the next
+        // 'ready' restarts the plugin (startUp sets the status again).
+        sub('fault', (data) => {
+            if(data===undefined || data===null || data.from!=="core") return;
+            this.status({ fill: 'red', shape: 'ring', text: `System ${config.system.replace('s','S')}: core fault` });
+        });
         sub('pluginFan', (data) => {
                 let co2 = data.co2Sensor;
                 let low_co2_limit = data.low_co2_limit;

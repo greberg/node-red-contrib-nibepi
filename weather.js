@@ -80,6 +80,12 @@ module.exports = function(RED) {
                 if(coreConnected(server)) start();
             }
         })
+        // A core fault means the pump link is down: show it until the next
+        // 'ready' restarts the plugin (startUp sets the status again).
+        sub('fault', (data) => {
+            if(data===undefined || data===null || data.from!=="core") return;
+            this.status({ fill: 'red', shape: 'ring', text: `System ${system}: core fault` });
+        });
         sub('pluginWeather', (data) => {
             if(data.system===config.system) {
                 let outside = data['outside'];

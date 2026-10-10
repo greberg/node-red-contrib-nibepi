@@ -85,6 +85,13 @@ module.exports = function(RED) {
                 if(coreConnected(server)) start();
             }
         })
+        // A core fault means the pump link is down: show it until the next
+        // 'ready' restarts the plugin (startUp sets the status again).
+        sub('fault', (data) => {
+            if(data===undefined || data===null || data.from!=="core") return;
+            announced = false;
+            this.status({ fill: 'red', shape: 'ring', text: `RMU 40 ${config.system.replace('s','S')}: core fault` });
+        });
         sub('pluginRMU', (data) => {
             if(data.system===config.system) {
                 if(data.rmuSensor!==undefined) this.send({topic:"Inomhustemperatur",payload:data.rmuSensor.data});
