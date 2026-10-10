@@ -122,7 +122,11 @@ module.exports = function(RED) {
             }
         })
 
-        node.on('close', function() {
+        node.on('close', function(removed) {
+
+            // A deleted plugin node must stop feeding its registers to the control loop.
+
+            if(removed===true && server && typeof server.clearList==='function') server.clearList('indoor',config.system);
             let system = config.system.replace('s','S');
             node.status({ fill: 'yellow', shape: 'dot', text: `System ${system}` });
         });

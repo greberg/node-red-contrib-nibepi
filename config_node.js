@@ -2348,10 +2348,10 @@ vvLastAiControl = (hw.enable_vv_ai_control === true);
         const promise = new Promise((resolve,reject) => {
             for( var i = 0; i < getList.length; i++){
                 if(getList[i].system===system) {
-                    for( var j = 0; j < getList[i].registers.length; j++){
+                    // Backwards: splicing while walking forwards skipped the next entry.
+                    for( var j = getList[i].registers.length - 1; j >= 0; j--){
                         if(getList[i].registers[j].plugin!==undefined) {
-                            let len = getList[i].registers[j].plugin.length;
-                            for( var k = 0; k <len ; k++){
+                            for( var k = getList[i].registers[j].plugin.length - 1; k >= 0; k--){
                                 if(getList[i].registers[j].plugin[k]===plugin) {
                                     getList[i].registers[j].plugin.splice(k,1);
                                     if(getList[i].registers[j].plugin.length===0) {

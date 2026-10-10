@@ -107,7 +107,11 @@ module.exports = function(RED) {
                 if(data['evaporator']!==undefined) this.send({topic:"Förångartemperatur",payload:data['evaporator'].raw_data});
         })
 
-        this.on('close', function() {
+        this.on('close', function(removed) {
+
+            // A deleted plugin node must stop feeding its registers to the control loop.
+
+            if(removed===true && server && typeof server.clearList==='function') server.clearList('fan',config.system);
             let system = config.system.replace('s','S');
             this.status({ fill: 'yellow', shape: 'dot', text: `System ${system}` });
         });

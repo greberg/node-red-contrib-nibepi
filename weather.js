@@ -98,7 +98,9 @@ module.exports = function(RED) {
                 this.send([null,{topic:"Vindgraf",payload:data.windGraph}]);
             }
         })
-        this.on('close', function() {
+        this.on('close', function(removed) {
+            // A deleted plugin node must stop feeding its registers to the control loop.
+            if(removed===true && server && typeof server.clearList==='function') server.clearList('weather',config.system);
             this.status({ fill: 'yellow', shape: 'dot', text: `System ${system}` });
         });
     }
