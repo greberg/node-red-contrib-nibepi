@@ -1,13 +1,70 @@
-
+const { parseRegisterValue } = require('./node_util');
 module.exports = function(RED) {
     function nibeOutput(config) {
         RED.nodes.createNode(this,config);
-        var timer = {};
+        // Every pending timer, so close() can stop them from touching a
+        // closed node.
+        const timers = new Set();
+        const later = (fn, ms) => {
+            const t = setTimeout(() => { timers.delete(t); fn(); }, ms);
+            timers.add(t);
+            return t;
+        };
+        const cancel = (t) => { clearTimeout(t); timers.delete(t); };
+        let closed = false;
+        this.on('close', function() {
+            closed = true;
+            for (const t of timers) clearTimeout(t);
+            timers.clear();
+        });
         this.server = RED.nodes.getNode(config.server);
+        if (!this.server) {
+            this.status({ fill: 'red', shape: 'dot', text: `No configuration node configured` });
+            return;
+        }
         const nibe = this.server.nibe;
-        if (this.server) {
-            
-            this.on('input', function(msg) {
+        // Write value to register. The value is validated first: setData
+        // multiplies it by the register factor, so a non-numeric payload would
+        // go to the pump as NaN/garbage. sendMsg is what goes out on success.
+        const writeRegister = (register, payload, sendMsg, origMsg) => {
+            const value = parseRegisterValue(payload);
+            if(value===undefined) {
+                this.status({ fill: 'red', shape: 'dot', text: `Invalid value: ${payload}` });
+                this.error(`Not sending ${JSON.stringify(payload)} to register ${register}: not a number`, origMsg);
+                return;
+            }
+            this.status({ fill: 'yellow', shape: 'dot', text: `${value}` });
+            let timedOut = false;
+            let done = false;
+            const timeout = later(() => {
+                timedOut = true;
+                this.status({ fill: 'red', shape: 'dot', text: `Timeout setting data` });
+            }, 10000);
+            nibe.setData(register,value,(err,result) => {
+                // setData should call back once; ignore any extra call.
+                if(done || closed) return;
+                done = true;
+                cancel(timeout);
+                if(err) {
+                    this.status({ fill: 'red', shape: 'dot', text: `Error setting data` });
+                    this.error(err, origMsg);
+                    return;
+                }
+                if(result===true) {
+                    if(timedOut!==true) {
+                        sendMsg.payload = value;
+                        this.send(sendMsg);
+                        this.status({ fill: 'green', shape: 'dot', text: `${value}` });
+                        later(() => {
+                            this.status({ fill: 'yellow', shape: 'dot', text: `` });
+                        }, 10000);
+                    }
+                } else {
+                    this.status({ fill: 'red', shape: 'dot', text: `Timeout setting data` });
+                }
+            });
+        };
+        this.on('input', function(msg) {
                 let register = config.name;
             if(this.server.hP()[config.name]!==undefined) {
                 register = this.server.hP()[config.name]
@@ -25,7 +82,7 @@ module.exports = function(RED) {
                 } else if(msg.topic=="refreshConfig" || config.name=="refreshConfig") {
                     nibe.refreshConfig();
                     this.status({ fill: 'green', shape: 'dot', text: `Refreshing configuration` });
-                    timer[register] = setTimeout(() => {
+                    later(() => {
                         this.status({ fill: 'yellow', shape: 'dot', text: `` });
                     }, 10000);
                  } else if(msg.topic=="addSensor" || config.name=="addSensor") {
@@ -49,56 +106,11 @@ module.exports = function(RED) {
                     }));
                     
                 } else if(config.name===undefined || config.name=="") {
-                    msg = {topic:msg.topic,payload:msg.payload};
-                    this.status({ fill: 'yellow', shape: 'dot', text: `${msg.payload}` });
-                    timer[register] = setTimeout(() => {
-                        this.status({ fill: 'red', shape: 'dot', text: `Timeout setting data` });
-                    }, 10000);
-                    nibe.setData(register,msg.payload,(err,result) => {
-                        if(err) return console.log(err);
-                        if(result===true) {
-                            if(timer[register]._called!==true) {
-                                this.send({topic:msg.topic,payload:msg.payload});
-                                this.status({ fill: 'green', shape: 'dot', text: `${msg.payload}` });
-                                setTimeout(() => {
-                                    this.status({ fill: 'yellow', shape: 'dot', text: `` });
-                                }, 10000);
-                                clearTimeout(timer[register]);
-                            }
-                        } else {
-                            this.status({ fill: 'red', shape: 'dot', text: `Timeout setting data` });
-                        }
-                        
-                    });
+                    writeRegister(register, msg.payload, {topic:msg.topic}, msg);
                 } else {
-                    msg = {topic:register,payload:msg.payload};
-                    this.status({ fill: 'yellow', shape: 'dot', text: `${msg.payload}` });
-                    timer[register] = setTimeout(() => {
-                        this.status({ fill: 'red', shape: 'dot', text: `Timeout setting data` });
-                    }, 10000);
-                    nibe.setData(register,msg.payload,(err,result) => {
-                        if(err) return console.log(err);
-                        if(result===true) {
-                            if(timer[register]._called!==true) {
-                                this.send({topic:register,payload:msg.payload});
-                                this.status({ fill: 'green', shape: 'dot', text: `${msg.payload}` });
-                                setTimeout(() => {
-                                    this.status({ fill: 'yellow', shape: 'dot', text: `` });
-                                }, 10000);
-                                clearTimeout(timer[register]);
-                            }
-                        } else {
-                            this.status({ fill: 'red', shape: 'dot', text: `Timeout setting data` });
-                        }
-                        
-                    });
-                    
+                    writeRegister(register, msg.payload, {topic:register}, msg);
                 }
             });
-            
-        } else {
-            // No config node configured
-        }
     }
     RED.nodes.registerType("nibe-output",nibeOutput);
 }
