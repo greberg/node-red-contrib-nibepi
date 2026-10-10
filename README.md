@@ -1,3 +1,10 @@
+> **Archived (2026-10-10).** This fork is no longer used. NibePi was split into
+> an RS485/MQTT gateway ([nibepi-backend](https://github.com/greberg/nibepi-backend),
+> image `ghcr.io/greberg/nibepi-gateway`) and a Home Assistant component that
+> holds all control logic ([nibepi-ha](https://github.com/greberg/nibepi-ha)).
+> The last Node-RED based version is the tag
+> [`nodered-final`](https://github.com/greberg/node-red-contrib-nibepi/tree/nodered-final).
+
 # node-red-contrib-nibepi
 
 Node-RED nodes for NibePi, an interface to Nibe F-series heat pumps.
