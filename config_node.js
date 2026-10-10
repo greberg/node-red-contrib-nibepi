@@ -6283,6 +6283,9 @@ const checkTranslation = (node) => {
         onNibe('fault',data => {
             if(data.from=="core") {
                 sendError(data.from,data.message);
+                // A backend with getHealth supervises the core itself and restarts it
+                // with backoff; restarting here too looped every ~2 s on a missing port.
+                if(typeof nibe.getHealth==='function') return;
                 nibe.core = undefined;
                 handleCore(nibe.getConfig(),true);
             } else {
