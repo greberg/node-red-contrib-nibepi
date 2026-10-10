@@ -5676,6 +5676,13 @@ const checkTranslation = (node) => {
     function checkRMU() {
         return rmu_ready;
     }
+    // RS485 bus health, once a minute from the backend. Exposed as the
+    // 'bus_health' register so a nibe-input node named bus_health can show
+    // it, and in global context for function nodes.
+    nibe.data.on('busHealth',data => {
+        nibeData.emit('bus_health',{register:'bus_health',data:data.errors,unit:' fel/min',raw_data:data,timestamp:data.timestamp});
+        this.context().global.set('bus_health', data);
+    })
     nibe.data.on('updateSensor',data => {
         // Restart plugins so they pick up the changed sensor list - but only
         // once the pump is connected. nibe.core is set when the pump has
